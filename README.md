@@ -46,11 +46,6 @@ worst-case pin voltage ~1.76 V even at 40 V load dump). `readAnalogMv()` reports
 **source millivolts**: node × (100k+4.6k)/4.6k ≈ ×22.74. A4 additionally caps at
 60000 mV so an unplugged sender reads EMPTY (safe direction), not wrapped-full.
 
-A3/A4 are wired ground-side-switched / passive-resistive respectively:
-- A3 high beam: car wire → ~220 Ω → node, 100 kΩ top leg tied to +12 V so the
-  GND-switched circuit is visible; firmware runs it in L-mode.
-- A4 fuel sender: 3V3 → **220 Ω** → node ← sender → GND (Toyota FSM sender
-  family: FULL≈3 Ω … EMPTY≈110 Ω). OEM gauge must be disconnected from the line.
 
 ## ESP-NOW protocol
 
