@@ -45,7 +45,7 @@ static constexpr uint8_t PIN_LED_DATA_DEF = 4; // old CAN RX pin — free since 
 static constexpr uint8_t  CAN_GROUP_COUNT = 9;   // outpc groups (72 bytes) carried in 0xA0
 static constexpr uint16_t DASH_TX_MS = 100;
 static constexpr uint32_t FAILSAFE_MS = 500;
-// A1-A4 input dividers: 22k top (signal->pin) + 4.6k bottom (pin->GND).
+// A1-A4 input dividers: 100k top (signal->pin) + 4.6k bottom (pin->GND).
 // readAnalogMv() reports SOURCE mV: pin_mV * (Rtop+Rbot)/Rbot.
 static constexpr float    ADC_R_TOP_OHM = 100000.0f;   // 2026-08-22: front-end rework — all channels 100k series
 static constexpr float    ADC_R_BOT_OHM = 4600.0f;
@@ -491,7 +491,8 @@ static void espnowSendStatus() {
     // v3 frame: v2 (gas% + per-channel source-mV) + live IAC duty % in [14].
     // Dash reads only [1](latch) and [4](warn) with a len>=8 guard, so the
     // extra bytes are ignored by old receivers — fully backward compatible.
-    uint8_t f[15] = {0};
+    // Extended v4: +[15]=fanMode(0/1/2) +[16]=iacMode(0/1/2) +[17]=buzzerOn +[18]=bootTestOn
+    uint8_t f[19] = {0};
     f[0] = FRAME_STATUS;
     uint8_t latch = 0;
     for (uint8_t i = 0; i < 4; i++) if (s_anLatch[i]) latch |= (1u << i);
@@ -505,6 +506,17 @@ static void espnowSendStatus() {
         f[6 + i * 2 + 1] = (uint8_t)(mv >> 8);
     }
     f[14] = (uint8_t)((uint32_t)ledcRead(0) * 100 / 1023);
+    // New mode state bytes
+    uint8_t fanMode = 0;
+    if (g_cfg.fanAuto) fanMode = 1;
+    else if (g_cfg.fanManual) fanMode = 2;
+    f[15] = fanMode;
+    uint8_t iacMode = 0;
+    if (g_cfg.iacAuto) iacMode = 1;
+    else if (g_cfg.iacFollow) iacMode = 2;
+    f[16] = iacMode;
+    f[17] = g_cfg.buzzerEnable ? 1 : 0;
+    f[18] = g_cfg.bootTest ? 1 : 0;
     esp_err_t r = esp_now_send(ESP_NOW_BROADCAST, f, sizeof(f));
     s_txB0Count++;
     if (r != ESP_OK) {
@@ -529,11 +541,12 @@ static void espnowSendAck(const char* cmd) {
 }
 
 static void espnowSendSnapshot() {
-    uint8_t f[23] = {0};
-    auto wr16 = [&](int o, int v){ f[o] = (uint8_t)(v & 0xFF); f[o+1] = (uint8_t)((v >> 8) & 0xFF); };
-    // [2]=canFresh [3..16]=rpm,map,mat,clt,tps,batt,afr LE [17]=iac%
+    // v2 snapshot: [2]=canFresh [3..16]=rpm,map,mat,clt,tps,batt,afr LE [17]=iac%
     // [18]=flags b0 fan b1 follow b2 auto b4 buzzing b5 eng-enabled
     // [19..20]=iacTarget [21]=O1-7 bitmask [22]=warnLatched low byte
+    // v3: +[23]=fanMode(0/1/2) +[24]=iacMode(0/1/2) +[25]=bootTestOn +[26]=reserved
+    uint8_t f[27] = {0};
+    auto wr16 = [&](int o, int v){ f[o] = (uint8_t)(v & 0xFF); f[o+1] = (uint8_t)((v >> 8) & 0xFF); };
     f[0] = FRAME_REPLY; f[1] = 0x01;
     f[2] = s_canFresh ? 1 : 0;
     wr16(3,  (int)g_rpm); wr16(5,  (int)g_map); wr16(7,  (int)g_mat);
@@ -550,6 +563,17 @@ static void espnowSendSnapshot() {
     for (uint8_t i = 0; i < 7; i++) if (digitalRead(g_cfg.pin.out[i])) outs |= (1u << i);
     f[21] = outs;
     f[22] = (uint8_t)(s_warnLatched & 0xFF);
+    // New mode state bytes (v3)
+    uint8_t fanMode = 0;
+    if (g_cfg.fanAuto) fanMode = 1;
+    else if (g_cfg.fanManual) fanMode = 2;
+    f[23] = fanMode;
+    uint8_t iacMode = 0;
+    if (g_cfg.iacAuto) iacMode = 1;
+    else if (g_cfg.iacFollow) iacMode = 2;
+    f[24] = iacMode;
+    f[25] = g_cfg.bootTest ? 1 : 0;
+    f[26] = 0; // reserved
     esp_now_send(ESP_NOW_BROADCAST, f, sizeof(f));
 }
 
@@ -734,13 +758,21 @@ static uint16_t engineWarnFlags() {
     bool onThrottle = s_groupSeen[3] && g_tps >= 50;
     bool afrOk = onThrottle && g_afr >= 100 && g_afr <= 250;
 
-    if (g_rpm >= g_cfg.eng.maxRpm) raw |= W_OVERREV;
-    if (g_rpm > 0 && g_rpm < g_cfg.eng.idleRpmMin && g_tps < 200) raw |= W_IDLE_LO;
-    if (g_rpm > 0 && g_rpm > g_cfg.eng.idleRpmMax && g_tps < 200) raw |= W_IDLE_HI;
+    // Partial-frame hardening: only trust a field if its group was present in
+    // the current frame. On a real 0xA0 broadcast all 9 groups arrive together,
+    // but if a frame is ever partial, g_* values from a previous frame would be
+    // stale here and could misfire a warning / mis-drive an actuator.
+    bool rpmOk = s_groupSeen[0];
+    bool tpsOk = s_groupSeen[3];
+    bool battOk = s_groupSeen[3];
+
+    if (rpmOk && g_rpm >= g_cfg.eng.maxRpm) raw |= W_OVERREV;
+    if (rpmOk && g_rpm > 0 && g_rpm < g_cfg.eng.idleRpmMin && tpsOk && g_tps < 200) raw |= W_IDLE_LO;
+    if (rpmOk && g_rpm > 0 && g_rpm > g_cfg.eng.idleRpmMax && tpsOk && g_tps < 200) raw |= W_IDLE_HI;
     if (cltOk && g_clt > g_cfg.eng.cltMax) raw |= W_OVERHEAT;
     if (matOk && g_mat > g_cfg.eng.matMax) raw |= W_HOTAIR;
-    if (g_batt > 0 && g_batt < g_cfg.eng.battMin) raw |= W_LOWBATT;
-    if (g_batt > 0 && g_batt > g_cfg.eng.battMax) raw |= W_HIBATT;
+    if (battOk && g_batt > 0 && g_batt < g_cfg.eng.battMin) raw |= W_LOWBATT;
+    if (battOk && g_batt > 0 && g_batt > g_cfg.eng.battMax) raw |= W_HIBATT;
     if (s_groupSeen[2] && g_map > g_cfg.eng.mapMax) raw |= W_OVERBOOST;
     if (afrOk && g_afr > g_cfg.eng.afrHigh) raw |= W_LEAN;
     if (afrOk && g_afr < g_cfg.eng.afrLow) raw |= W_RICH;
@@ -807,9 +839,14 @@ static void updateOutputs() {
             duty = interpolateIac(120);
         } else {
             duty = interpolateIac(clt / 10);
-            int16_t err = g_cfg.iacTargetRpm - (int16_t)g_rpm;
-            int16_t trim = constrain((int16_t)(err / 20), -5, 8);
-            duty = constrain((int16_t)duty + trim, 5, kIacDutyMax);
+            // Trim idle towards the target rpm, but only if the current frame
+            // actually carried RPM — otherwise g_rpm is stale and the trim is
+            // garbage. Partial-frame hardening (see engineWarnFlags).
+            if (s_groupSeen[0]) {
+                int16_t err = g_cfg.iacTargetRpm - (int16_t)g_rpm;
+                int16_t trim = constrain((int16_t)(err / 20), -5, 8);
+                duty = constrain((int16_t)duty + trim, 5, kIacDutyMax);
+            }
         }
     } else {
         duty = g_cfg.iacManualDuty;
@@ -1146,7 +1183,9 @@ static void updateGasDisplay() {
 static void initGasTft() {
     if (!g_cfg.tftEnable) return;
     if (s_gasTft == nullptr) {
-        s_gasTft = new Adafruit_GC9A01A(GAS_CS, GAS_DC, GAS_MOSI, GAS_SCLK, -1);
+        // PINS SWAPPED: gas renderer now drives the screen on the idle-CS/DC
+        // (CS17/DC18). Idle renderer took over GAS_CS2/DC21 in initTft().
+        s_gasTft = new Adafruit_GC9A01A(g_cfg.pin.tftCs, g_cfg.pin.tftDc, GAS_MOSI, GAS_SCLK, -1);
     }
     s_gasTft->begin();
     s_gasTft->setRotation(1);
@@ -1162,7 +1201,9 @@ static void teardownTft() {
 static void initTft() {
     if (g_cfg.tftEnable) {
         if (s_tft == nullptr) {
-            s_tft = new Adafruit_GC9A01A(g_cfg.pin.tftCs, g_cfg.pin.tftDc,
+            // PINS SWAPPED: idle renderer now drives the screen on the gas-CS/DC
+            // (CS2/DC21). Gas renderer took over the idle CS17/DC18 in initGasTft().
+            s_tft = new Adafruit_GC9A01A(GAS_CS, GAS_DC,
                                          g_cfg.pin.tftMosi, g_cfg.pin.tftSclk, -1);
         }
         s_tft->begin();
