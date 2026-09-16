@@ -79,7 +79,7 @@ all outputs off, IAC to fail duty (0%), warnings suppressed. The heartbeat
 
 | Output | Modes (`O<n>…`) |
 |--------|-----------------|
-| Fan (channel `Y <1-7>`, default 6) | auto hysteresis (`F <on °F>` 100–280 validated / `E <off °F>` 90–270) or manual `F 1/0`; re-pointing `Y` releases the old channel first |
+| Fan (channel `Y <1-7>`, default 6) | auto hysteresis at fixed temps (on 180°F / off 170°F) or manual `F 1/0`; re-pointing `Y` releases the old channel first |
 | O1–O7 | `O<n> 0`=off · `O<n> 1`=on · `O<n> T<°F>`=coolant temp trigger · `O<n> R<rpm>`=RPM trigger · plain value = manual state |
 | Shift light | `S <rpm>` sets O1 to RPM mode at that speed (hardwired light output path) |
 | Warn output | `W warnout <0-7>` blinks a channel at 500 ms while any warning latches (skipped if == fanOut) |
@@ -154,8 +154,7 @@ get a clean status dump.
 M                    link mode report ("proto=ms2 link=espnow")
 G 1|0                simulation on/off (+ report)
 Z 1|0                boot self-test
-F <on°F>|A|1|0       fan on-temp / auto / manual
-E <off°F>            fan off-temp
+F A|1|0              fan auto / manual (temps fixed at on 180°F / off 170°F)
 I <duty>|A|F         IAC manual / auto / follow
 T <rpm>              AUTO target
 Y <1-7|0>            fan output channel

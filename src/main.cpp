@@ -111,8 +111,8 @@ struct Cfg {
     PinMap pin;
     uint8_t proto = 0;               // kept for NVS layout compat (always MS2/UART link)
     bool    tftEnable = true;
-    int16_t fanOnTemp = 2000;
-    int16_t fanOffTemp = 1900;
+    int16_t fanOnTemp = 1800;
+    int16_t fanOffTemp = 1700;
     bool    fanAuto = true;
     bool    fanManual = false;
     int16_t iacTargetRpm = 900;
@@ -198,6 +198,11 @@ static uint8_t interpolateIac(int16_t cltF) {
 static void setFan(bool on) {
     if (g_cfg.fanOut >= 1 && g_cfg.fanOut <= 7) digitalWrite(g_cfg.pin.out[g_cfg.fanOut - 1], on ? HIGH : LOW);
 }
+// Fan run-on: after auto mode drops the fan at fanOffTemp, keep it running a
+// few extra seconds to bleed residual radiator heat -> widens the effective
+// hysteresis, slows cycling. Applies ONLY to the auto hysteresis path; manual
+// off and the overheat/failsafe paths stay instant (see updateOutputs).
+static constexpr uint32_t FAN_RUNON_MS = 5000;
 static void setOut(uint8_t i, bool on) { digitalWrite(g_cfg.pin.out[i], on ? HIGH : LOW); }
 // Measured on the bench (2026-08-22): rotary ISC rotor reaches its mechanical
 // full-open stop at ~94% PWM duty; above that it slams the stop and bounces.
@@ -385,6 +390,8 @@ static uint8_t  s_anLatchByte = 0;
 static uint8_t  s_seq = 0;
 static uint16_t s_warnLatched = 0;   // forward decl (real def below)
 static int gasPercent();
+static void gasAutoCal();
+static void saveCfg();
 
 static uint32_t s_rxA0Count = 0;
 static uint32_t s_rxC0Count = 0;
@@ -802,13 +809,32 @@ static void updateOutputs() {
     if (g_cfg.fanAuto) {
         if (cltOk) {
             static bool fanState = false;
-            if (!fanState && clt >= g_cfg.fanOnTemp) fanState = true;
-            else if (fanState && clt <= g_cfg.fanOffTemp) fanState = false;
+            static bool fanAutoPrev = false;    // tracks auto-mode continuity
+            static uint32_t fanRunOnStart = 0;
+            // Mode-switch guard: if we left auto and came back, reset the
+            // run-on timer so a stale value can't force a spurious run-on.
+            if (!fanAutoPrev) fanRunOnStart = 0;
+            fanAutoPrev = true;
+            if (!fanState && clt >= g_cfg.fanOnTemp) {
+                fanState = true;
+            } else if (fanState && clt <= g_cfg.fanOffTemp) {
+                fanState = false;
+                fanRunOnStart = millis();
+            }
             fanOn = fanState;
+            // Run-on: hold a few seconds after the off trigger (auto cycling
+            // only) to bleed residual heat and slow the on/off oscillation.
+            if (!fanState && fanRunOnStart && (millis() - fanRunOnStart) < FAN_RUNON_MS) fanOn = true;
         }
     } else {
         fanOn = g_cfg.fanManual;
     }
+    // Emergency override: if the engine is at fan-on temp, force the fan on
+    // regardless of mode (auto/manual/off). Overrides fanManual=false and
+    // fanAuto=false so a disabled fan can never kill the engine on a hot day.
+    // Fires at the same fixed fanOnTemp (180F) as auto mode — the fan never
+    // runs hotter than 180 nominal in any mode.
+    if (cltOk && clt >= g_cfg.fanOnTemp) fanOn = true;
     fanOn = fanOn || inputForces(7);
     setFan(fanOn);
 
@@ -1003,6 +1029,92 @@ static int gasPercent() {
     return 0;
 }
 
+// Min/Max tank-float log: lowest & highest readings ever seen, in BOTH
+// damped mv and the resulting %. Lives under its OWN NVS key ("gaslog") so
+// adding/changing it can never resize the main "cfg" blob (whose sizeof/
+// magic guard would silently wipe the calibrated gasCalMv table). Fully
+// automatic — self-seeds from the first plausible reading, records extremes
+// forever, never wiped. Empty reference = g_cfg.gasCalMv[4] (SET E), untouched.
+static constexpr uint8_t GASLOG_MAGIC = 0x4C;
+struct GasLog {
+    uint8_t  magic  = GASLOG_MAGIC;
+    int8_t   minPct = -1;   // -1 = unseeded
+    int8_t   maxPct = -1;
+    int16_t  minMv  = -1;
+    int16_t  maxMv  = -1;
+};
+static GasLog s_gasLog;
+
+static void gasLogSave() {
+    g_prefs.putBytes("gaslog", &s_gasLog, sizeof(s_gasLog));
+}
+
+static void gasLogLoad() {
+    size_t len = g_prefs.getBytes("gaslog", &s_gasLog, sizeof(s_gasLog));
+    if (len != sizeof(s_gasLog) || s_gasLog.magic != GASLOG_MAGIC) {
+        s_gasLog = GasLog{};   // unseeded; first plausible read owns min=max
+    }
+}
+
+static void gasLogUpdate() {
+    int mv  = s_gasFilt;
+    int pct = gasPercent();
+    // Plausibility gate: a dead/disconnected sender rails to the 32000 clamp
+    // (open node ~75k) and reads 0%, a hard short reads ~0 and 100% — neither
+    // is a real tank level. Only log inside the sender's live window.
+    if (mv < 1000 || mv >= 32000) return;
+    if (pct < 0 || pct > 100) return;
+    if (s_gasLog.minPct < 0) {
+        s_gasLog.minPct = s_gasLog.maxPct = (int8_t)pct;
+        s_gasLog.minMv  = s_gasLog.maxMv  = (int16_t)mv;
+        gasLogSave();
+        return;
+    }
+    bool changed = false;
+    if (pct < s_gasLog.minPct) { s_gasLog.minPct = (int8_t)pct; changed = true; }
+    if (pct > s_gasLog.maxPct) { s_gasLog.maxPct = (int8_t)pct; changed = true; }
+    if (mv  < s_gasLog.minMv)  { s_gasLog.minMv  = (int16_t)mv; changed = true; }
+    if (mv  > s_gasLog.maxMv)  { s_gasLog.maxMv  = (int16_t)mv; changed = true; }
+    if (changed) gasLogSave();
+
+    gasAutoCal();
+}
+
+// Auto-calibrate the E/F anchors from the float's REAL extremes recorded in
+// the tank log: once the float has actually reached near-full and near-empty,
+// commit those measured mV as the FULL/EMPTY anchors and re-linearise the
+// mids (same math as Q F/E). No manual steps — just drive the tank to both
+// ends once. Low mV = full, high mV = empty (matching gasCalMv ordering).
+static void gasAutoCal() {
+    if (s_gasLog.minPct < 0) return;              // log not seeded yet
+    bool dirty = false, relin = false;
+
+    if (s_gasLog.maxPct >= 95 && s_gasLog.minMv > 1000 &&
+        s_gasLog.minMv < g_cfg.gasCalMv[0] - 50 &&
+        s_gasLog.minMv < g_cfg.gasCalMv[4]) {
+        g_cfg.gasCalMv[0] = (uint16_t)s_gasLog.minMv;       // FULL anchor
+        dirty = relin = true;
+        Serial.printf("gas auto-cal: F set = %u mv\n", g_cfg.gasCalMv[0]);
+    }
+    if (s_gasLog.minPct <= 5 && s_gasLog.maxMv < 32000 &&
+        s_gasLog.maxMv > g_cfg.gasCalMv[4] + 50 &&
+        s_gasLog.maxMv > g_cfg.gasCalMv[0]) {
+        g_cfg.gasCalMv[4] = (uint16_t)s_gasLog.maxMv;       // EMPTY anchor
+        dirty = relin = true;
+        Serial.printf("gas auto-cal: E set = %u mv\n", g_cfg.gasCalMv[4]);
+    }
+    if (relin && g_cfg.gasCalMv[0] < g_cfg.gasCalMv[4]) {
+        for (uint8_t j = 1; j < 4; j++)
+            g_cfg.gasCalMv[j] = g_cfg.gasCalMv[0] +
+                (uint16_t)((uint32_t)(g_cfg.gasCalMv[4] - g_cfg.gasCalMv[0]) * j / 4);
+        Serial.println("gas auto-cal: mids re-linearised");
+    }
+    if (dirty) {
+        s_gasFilt = -1;                          // reseed filter after cal change
+        saveCfg();
+    }
+}
+
 // Needle gauge: center pivot (120,128), 240 deg sweep (150..390) across the top,
 // leaving a bottom gap for the % / mv text. Ticks are radial lines at 6 deg steps.
 static constexpr int   GAS_CX = 120;
@@ -1048,6 +1160,10 @@ static char s_lastGasPct[8] = "";
 static uint16_t s_lastPctColor = 0xFFFF;
 static char s_lastGasLow[10] = "";
 static uint16_t s_lastLowColor = 0xFFFF;
+static char s_lastGasLo[8] = "";
+static char s_lastGasHi[8] = "";
+static char s_lastGasLoMv[8] = "";
+static char s_lastGasHiMv[8] = "";
 static bool  s_needleDrawn = false;
 static float s_needleDeg = 0.0f;
 static int   s_gasDisp = -1;
@@ -1120,7 +1236,8 @@ static void drawGasFrame() {
     s_gasDisp = -1;
     s_lowWas = false;
     s_blinkPhase = false;
-    s_lastGasMv[0] = s_lastGasPct[0] = s_lastGasLow[0] = 0;
+    s_lastGasMv[0] = s_lastGasPct[0] = s_lastGasLow[0] = s_lastGasLo[0] = s_lastGasHi[0] = 0;
+    s_lastGasLoMv[0] = s_lastGasHiMv[0] = 0;
     s_lastPctColor = s_lastLowColor = 0xFFFF;
 }
 
@@ -1178,6 +1295,24 @@ static void updateGasDisplay() {
     snprintf(buf, sizeof buf, "%d%%", s_gasDisp);
     uint16_t pctColor = low ? (phase ? GC9A01A_RED : GC9A01A_DARKGREY) : GC9A01A_CYAN;
     drawGasText(88, 208, 2, 68, pctColor, s_lastGasPct, &s_lastPctColor, buf);
+
+    // Min/Max tank-float log: a yellow band on the tick ring tracing the
+    // sweep the float has covered (from LO% up to HI%). The needle already
+    // shows the live level, so the band reads instantly with no text.
+    static int16_t s_bandMin = -2, s_bandMax = -2;
+    int16_t bMin = s_gasLog.minPct, bMax = s_gasLog.maxPct;
+    if (bMin != s_bandMin || bMax != s_bandMax) {
+        if (s_bandMin >= 0) {            // erase previous band
+            for (int a = s_bandMin; a <= s_bandMax; a += 2)
+                drawGasTick(gasAngleDeg(a), GC9A01A_DARKGREY);
+        }
+        if (bMin >= 0) {                 // draw new band
+            for (int a = bMin; a <= bMax; a += 2)
+                drawGasTick(gasAngleDeg(a), GC9A01A_YELLOW);
+        }
+        s_bandMin = bMin;
+        s_bandMax = bMax;
+    }
 }
 
 static void initGasTft() {
@@ -1225,6 +1360,9 @@ static void loadCfg() {
         g_cfg = Cfg{};
         saveCfg();
     }
+    // Fan temps are now FIXED (command removed) — always authoritative.
+    g_cfg.fanOnTemp = 1800;
+    g_cfg.fanOffTemp = 1700;
 }
 
 static void reportStatus() {
@@ -1292,22 +1430,9 @@ static void handleCommand(const String& line) {
             else if (val == "1" || val == "0") {
                 g_cfg.fanAuto = false;
                 g_cfg.fanManual = (val == "1");
-            } else if (val.length() > 0) {
-                float t = val.toFloat();
-                if (t >= 100.0f && t <= 280.0f) {
-                    g_cfg.fanAuto = true;
-                    g_cfg.fanOnTemp = (int16_t)(t * 10.0f);
-                } else Serial.println("fan-on 100-280F");
-            }
+            } else Serial.println("fan A|1|0 only (temps fixed)");
             saveCfg();
             break;
-        case 'E': {
-            float t = val.toFloat();
-            if (t >= 90.0f && t <= 270.0f) g_cfg.fanOffTemp = (int16_t)(t * 10.0f);
-            else Serial.println("fan-off 90-270F");
-            saveCfg();
-            break;
-        }
         case 'I':
             if (val == "F") {
                 g_cfg.iacAuto = false;
@@ -1558,6 +1683,12 @@ static void handleCommand(const String& line) {
                           g_cfg.gasDamp, g_cfg.lowFuelPct, g_cfg.gasMpg, g_cfg.tankGalX10 / 10.0f,
                           g_cfg.gasCalMv[4], g_cfg.gasCalMv[3], g_cfg.gasCalMv[2],
                           g_cfg.gasCalMv[1], g_cfg.gasCalMv[0]);
+            if (s_gasLog.minPct < 0)
+                Serial.println("gas log: unseeded (learns from first tank read)");
+            else
+                Serial.printf("gas log: LO %d%% (%dmv) HI %d%% (%dmv)\n",
+                              s_gasLog.minPct, s_gasLog.minMv,
+                              s_gasLog.maxPct, s_gasLog.maxMv);
             break;
         case 'P': {
             // P              -> report map
@@ -1804,6 +1935,7 @@ void setup() {
 
     g_prefs.begin(kPrefsName, false);
     loadCfg();
+    gasLogLoad();
     loadDashMac();
     loadDiagMac();
     loadAnPol();
@@ -1871,6 +2003,12 @@ void loop() {
         tftLast = now;
         updateDisplay();
         updateGasDisplay();
+    }
+
+    static uint32_t gasLogLast = 0;
+    if (now - gasLogLast >= 100) {
+        gasLogLast = now;
+        gasLogUpdate();       // independent of TFT: logs forever, even TFT off
     }
 
     // Drain queued 0xC0 commands (executed in loop context, not WiFi task).
