@@ -1517,8 +1517,8 @@ static void reportStatus() {
                   gasPercent(), readAnalogMv(3),
                   (int)((long)gasPercent() * g_cfg.tankGalX10 * g_cfg.gasMpg / 1000),
                   g_cfg.gasDamp, g_cfg.lowFuelPct,
-                  g_cfg.gasCalMv[4], g_cfg.gasCalMv[3], g_cfg.gasCalMv[2],
-                  g_cfg.gasCalMv[1], g_cfg.gasCalMv[0]);
+                  g_cfg.gasCalMv[0], g_cfg.gasCalMv[1], g_cfg.gasCalMv[2],
+                  g_cfg.gasCalMv[3], g_cfg.gasCalMv[4]);
     Serial.printf("fan=%d fanon=%.1fF fanoff=%.1fF fanout=%d", g_cfg.fanOut >= 1 && g_cfg.fanOut <= 7 && digitalRead(g_cfg.pin.out[g_cfg.fanOut - 1]) ? 1 : 0,
                   g_cfg.fanOnTemp / 10.0f, g_cfg.fanOffTemp / 10.0f, g_cfg.fanOut);
     Serial.printf(" iac=%s duty=%d", g_cfg.iacFollow ? "follow" : (g_cfg.iacAuto ? "auto" : "manual"),
@@ -1837,8 +1837,8 @@ static void handleCommand(const String& line) {
                           gasPercent(), readAnalogMv(3),
                           (int)((long)gasPercent() * g_cfg.tankGalX10 * g_cfg.gasMpg / 1000),
                           g_cfg.gasDamp, g_cfg.lowFuelPct, g_cfg.gasMpg, g_cfg.tankGalX10 / 10.0f,
-                          g_cfg.gasCalMv[4], g_cfg.gasCalMv[3], g_cfg.gasCalMv[2],
-                          g_cfg.gasCalMv[1], g_cfg.gasCalMv[0]);
+                          g_cfg.gasCalMv[0], g_cfg.gasCalMv[1], g_cfg.gasCalMv[2],
+                          g_cfg.gasCalMv[3], g_cfg.gasCalMv[4]);
             if (s_gasLog.minPct < 0)
                 Serial.println("gas log: unseeded (learns from first tank read)");
             else
