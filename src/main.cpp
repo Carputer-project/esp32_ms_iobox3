@@ -1,4 +1,5 @@
 #include <Arduino.h>
+#include <driver/pcnt.h>
 #include <esp_now.h>
 #include <WiFi.h>
 #include <Preferences.h>
@@ -41,6 +42,7 @@ static constexpr uint8_t PIN_O6_DEF  = 25;
 static constexpr uint8_t PIN_O7_DEF  = 33;
 static constexpr uint8_t PIN_BUZZ_DEF = 32;   // only free clean pin on iobox3
 static constexpr uint8_t PIN_LED_DATA_DEF = 4; // old CAN RX pin — free since ESP-NOW migration
+static constexpr uint8_t PIN_SPEED = 5;      // ABS speed input (LM393 -> PCNT) — old CAN TX, free
 
 static constexpr uint8_t  CAN_GROUP_COUNT = 9;   // outpc groups (72 bytes) carried in 0xA0
 static constexpr uint16_t DASH_TX_MS = 100;
@@ -55,7 +57,7 @@ enum OutMode : uint8_t { OM_OFF = 0, OM_MAN = 1, OM_TEMP = 2, OM_RPM = 3 };
 
 // ESP-NOW link to the dash (replaces the CAN bus). Frame protocol:
 //   0xA0 dash -> iobox3: [0xA0][maskLo][maskHi][72B outpc]  = 75B @10Hz
-//   0xB0 iobox3 -> dash: [0xB0][anLatch][0][seq][warn][0][0][0] = 8B @10Hz
+//   0xB0 iobox3 -> dash: [0xB0][anLatch][spd][seq][warn][gas][a1..a4 mV][iac%][modes] = 19B @10Hz
 //   0xC0 dash -> iobox3: [0xC0][len][cmd...]
 // Both stay on a fixed channel (1) so no AP association is required.
 static constexpr uint8_t  FRAME_ECU    = 0xA0;
@@ -106,6 +108,12 @@ struct PinMap {
 };
 
 static constexpr uint16_t CFG_MAGIC = 0x4971;   // 0x4970→0x4971: wipe poisoned gas table (E=0 inversion), adopt 220R-front-end defaults
+// Stock gas anchors (reported mV) for the 220R-from-3V3 A4 front end:
+// FULL=3R/1009, EMPTY=110R/25014 (Toyota FSM sender spec). Used by `Q R` to
+// clear poisoned calibration and as a safe mapping fallback in gasPercent()
+// when the recorded anchors are degenerate/off-scale — so the needle can
+// never pin at 100% on garbage data (see 2026-09-20 gas-stuck-at-full fix).
+static constexpr uint16_t kGasStockMv[5] = {1009, 4800, 9800, 16418, 25014};
 struct Cfg {
     uint16_t magic = CFG_MAGIC;
     PinMap pin;
@@ -382,13 +390,14 @@ static void applyPinConfig();
 // ESP-NOW link to the dash (replaces CAN + UART).
 // Frame protocol:
 //   0xA0 dash -> iobox3: [0xA0][maskLo][maskHi][72B outpc]  = 75B @10Hz
-//   0xB0 iobox3 -> dash: [0xB0][anLatch][0][seq][warn][0][0][0] = 8B @10Hz
+//   0xB0 iobox3 -> dash: [0xB0][anLatch][spd][seq][warn][gas][a1..a4 mV][iac%][modes] = 19B @10Hz
 //   0xC0 dash -> iobox3: [0xC0][len][cmd...]
 // Both devices stay on a fixed channel (1) so no AP association is required.
 // ---------------------------------------------------------------------------
 static uint8_t  s_anLatchByte = 0;
 static uint8_t  s_seq = 0;
 static uint16_t s_warnLatched = 0;   // forward decl (real def below)
+static volatile float s_speedMph = 0; // ABS speed, mph (0xB0 f[2])
 static int gasPercent();
 static void gasAutoCal();
 static void saveCfg();
@@ -499,11 +508,13 @@ static void espnowSendStatus() {
     // Dash reads only [1](latch) and [4](warn) with a len>=8 guard, so the
     // extra bytes are ignored by old receivers — fully backward compatible.
     // Extended v4: +[15]=fanMode(0/1/2) +[16]=iacMode(0/1/2) +[17]=buzzerOn +[18]=bootTestOn
+    // v5: [2] (was spare 0) now carries speed mph from the ABS/LM393 input.
     uint8_t f[19] = {0};
     f[0] = FRAME_STATUS;
     uint8_t latch = 0;
     for (uint8_t i = 0; i < 4; i++) if (s_anLatch[i]) latch |= (1u << i);
     f[1] = latch;
+    f[2] = (uint8_t)constrain((int)s_speedMph, 0, 255);
     f[3] = ++s_seq;
     f[4] = (uint8_t)(s_warnLatched & 0xFF);
     f[5] = (uint8_t)constrain(gasPercent(), 0, 100);
@@ -528,6 +539,76 @@ static void espnowSendStatus() {
     s_txB0Count++;
     if (r != ESP_OK) {
         Serial.printf("espnow send B0 FAILED: %s\n", esp_err_to_name(r));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Vehicle speed from a 2-wire passive ABS VR sensor (AE111 Corolla). The raw
+// AC sine is converted to a clean digital square wave by an LM393 conditioner
+// on GPIO5 (old CAN TX pin — free). PCNT counts teeth in hardware; every
+// DASH_TX_MS tick the counter delta is accumulated over a 1 s window and
+// converted to mph. The mph value rides in 0xB0 f[2] (previously a spare 0).
+// PULSES_PER_MPH is a place-holder: ~44-tooth front tone ring + ~1.85 m tyre.
+// CALIBRATE after install: drive a measured distance and set the constant
+// from pulses-per-mile (= pulses/km * 1.609). See abs_speed_sensor.md.
+static constexpr float   PULSES_PER_MPH = 10.6f;
+static constexpr pcnt_unit_t SPEED_PCNT_UNIT = (pcnt_unit_t)1;   // free (no other PCNT use)
+static constexpr int16_t SPEED_PCNT_H_LIM = 32767;
+// No s_pcntLast: with M3 the PCNT counter is cleared after every read and
+// re-arms from 0, so each tick's raw counter value IS the pulse delta.
+static int32_t           s_pcntAcc = 0;
+static uint32_t          s_speedWinMs = 0;
+
+static void speedInit() {
+    pcnt_config_t pc = {};
+    pc.pulse_gpio_num = (gpio_num_t)PIN_SPEED;
+    pc.ctrl_gpio_num  = PCNT_PIN_NOT_USED;
+    pc.lctrl_mode     = PCNT_MODE_KEEP;
+    pc.hctrl_mode     = PCNT_MODE_KEEP;
+    pc.pos_mode       = PCNT_COUNT_INC;   // count rising edges only
+    pc.neg_mode       = PCNT_COUNT_DIS;
+    pc.counter_h_lim  = SPEED_PCNT_H_LIM;
+    pc.counter_l_lim  = 0;
+    pc.unit           = (pcnt_unit_t)SPEED_PCNT_UNIT;
+    pc.channel        = PCNT_CHANNEL_0;
+    pcnt_unit_config(&pc);
+    pcnt_set_filter_value(SPEED_PCNT_UNIT, 100);   // reject < ~1.25 us noise
+    pcnt_filter_enable(SPEED_PCNT_UNIT);
+    pcnt_counter_pause(SPEED_PCNT_UNIT);
+    pcnt_counter_clear(SPEED_PCNT_UNIT);
+    pcnt_counter_resume(SPEED_PCNT_UNIT);
+    Serial.printf("speed: PCNT ch on GPIO%d ready (pulses/mph placeholder %.1f)\n",
+                  (int)PIN_SPEED, (double)PULSES_PER_MPH);
+}
+
+// dtMs between calls (call from the 10 Hz dash tick). Untouched when the
+// window isn't a full second, so the gauge stays frozen on the same value.
+static void speedTick(uint32_t dtMs) {
+    int16_t cnt = 0;
+    pcnt_get_counter_value((pcnt_unit_t)SPEED_PCNT_UNIT, &cnt);
+    // The ESP32 PCNT hardware wraps back to 0 when it hits h_lim (32767), NOT
+    // through two's complement — at 60 mph (~636 pulses/s) it resets every
+    // ~51.5 s ($H_LIM/$10.6). The old uint16 arithmetic only handled the true
+    // 2's-complement wrap, so the 32767->0 transition read as a huge negative
+    // delta and got swallowed by the ">0" guard -> a whole second of pulses
+    // were lost -> recurring mph dip every ~51 s at 60 mph (M3).
+    //
+    // Fix: byte delta off of the counter restarted from 0 each read. Clear the
+    // hardware counter after every sample so it can never reach h_lim, and
+    // count the current value directly as "pulses since last read".
+    pcnt_counter_clear(SPEED_PCNT_UNIT);   // re-arm; next cnt = pulses since now
+    int32_t delta = (int32_t)cnt;          // counter was 0 at the previous clear
+    if (delta > 0) {
+        s_pcntAcc += delta;
+        s_speedWinMs += dtMs;
+    } else {
+        s_speedWinMs += dtMs;  // keep the window advancing even while stopped
+    }
+    if (s_speedWinMs >= 1000) {
+        float hz = (float)s_pcntAcc * 1000.0f / (float)s_speedWinMs;
+        s_speedMph = hz / PULSES_PER_MPH;
+        s_pcntAcc = 0;
+        s_speedWinMs = 0;
     }
 }
 
@@ -806,11 +887,16 @@ static void updateOutputs() {
     bool cltOk = s_groupSeen[2] && clt > 100 && clt < 3500;
 
     bool fanOn = false;
+    // Hoisted to updateOutputs() scope (not the auto+cltOk block) so the
+    // manual branch below can clear the mode-continuity latch. Without the
+    // clear, a manual->auto round trip kept fanAutoPrev set from the last auto
+    // session and the mode-switch guard could never fire — the stale run-on
+    // timer then resurrected a spurious ~5 s fan run-on (M2, 2026-09-17).
+    static bool fanState = false;
+    static bool fanAutoPrev = false;    // tracks auto-mode continuity
+    static uint32_t fanRunOnStart = 0;
     if (g_cfg.fanAuto) {
         if (cltOk) {
-            static bool fanState = false;
-            static bool fanAutoPrev = false;    // tracks auto-mode continuity
-            static uint32_t fanRunOnStart = 0;
             // Mode-switch guard: if we left auto and came back, reset the
             // run-on timer so a stale value can't force a spurious run-on.
             if (!fanAutoPrev) fanRunOnStart = 0;
@@ -827,6 +913,10 @@ static void updateOutputs() {
             if (!fanState && fanRunOnStart && (millis() - fanRunOnStart) < FAN_RUNON_MS) fanOn = true;
         }
     } else {
+        // Left auto mode: clear the continuity latch so re-entering auto
+        // resets the run-on timer and can't resurrect a stale run-on.
+        fanAutoPrev = false;
+        fanRunOnStart = 0;
         fanOn = g_cfg.fanManual;
     }
     // Emergency override: if the engine is at fan-on temp, force the fan on
@@ -1015,15 +1105,49 @@ static int gasPercent() {
     // unplugs (open node rails toward 3V3 -> ~75k reported). 32k does both.
     // The old 16k cap silently froze every reading below ~half tank.
     s_gasFilt = (int16_t)constrain(f, 0, 32000);
-    const uint16_t *c = g_cfg.gasCalMv;   // c[0]=FULL(low mv) .. c[4]=EMPTY(high mv)
-    if (s_gasFilt <= c[0]) return 100;
-    if (s_gasFilt >= c[4]) return 0;
+
+    // Stuck-at-full poison guard (2026-09-20): a SET F pressed while the
+    // sender was unplugged recorded the ~60k clamp into the FULL anchor, and
+    // every real reading (11.3k-23.5k) is then <= c[0] -> needle pinned at
+    // 100% with SET EMPTY powerless (its check comes after the FULL check).
+    // Detect off-scale / hard-short / zero-span tables and map against the
+    // stock span instead, so the gauge keeps moving until a clean SET F/E.
+    uint16_t c[5];
+    const uint16_t *src = g_cfg.gasCalMv;
+    bool poisoned = (src[0] >= 30000 || src[4] >= 30000 ||   // open-sender clamp
+                     src[0] < 1000  || src[4] < 1000  ||     // hard-short reading
+                     src[0] == src[4]);                      // zero span
+    if (poisoned) src = kGasStockMv;
+    for (uint8_t i = 0; i < 5; i++) c[i] = src[i];
+
+    if (c[0] < c[4]) {   // normal slope: low mV = full, high mV = empty
+        if (s_gasFilt <= c[0]) return 100;
+        if (s_gasFilt >= c[4]) return 0;
+        for (uint8_t i = 0; i < 4; i++) {
+            if (s_gasFilt <= c[i + 1]) {
+                int hiPct = 100 - i * 25;         // % at c[i]
+                int loPct = 100 - (i + 1) * 25;   // % at c[i+1]
+                if (c[i + 1] == c[i]) return hiPct;
+                return loPct + (int32_t)(c[i + 1] - s_gasFilt) * (hiPct - loPct) / (c[i + 1] - c[i]);
+            }
+        }
+        return 0;
+    }
+
+    // Inverted slope: high mV = full, low mV = empty (sender reads high
+    // resistance at FULL). c[0] is the FULL high-mV anchor, c[4] the EMPTY
+    // low-mV anchor. Without this branch an inverted sender pins at 100%
+    // forever — every paired SET F/SET E re-records the same high/low anchors
+    // and the FULL-first check above never lets the needle fall.
+    if (s_gasFilt >= c[0]) return 100;
+    if (s_gasFilt <= c[4]) return 0;
     for (uint8_t i = 0; i < 4; i++) {
-        if (s_gasFilt <= c[i + 1]) {
-            int hiPct = 100 - i * 25;         // % at c[i]
-            int loPct = 100 - (i + 1) * 25;   // % at c[i+1]
-            if (c[i + 1] == c[i]) return hiPct;
-            return loPct + (int32_t)(c[i + 1] - s_gasFilt) * (hiPct - loPct) / (c[i + 1] - c[i]);
+        uint16_t a = c[i], b = c[i + 1];         // a >= b along the slope
+        if (a == b) continue;
+        if (s_gasFilt <= a && s_gasFilt >= b) {
+            int hiPct = 100 - i * 25;            // % at c[i] (FULL end)
+            int loPct = 100 - (i + 1) * 25;      // % at c[i+1] (EMPTY end)
+            return loPct + (int32_t)(a - s_gasFilt) * (hiPct - loPct) / (a - b);
         }
     }
     return 0;
@@ -1084,22 +1208,27 @@ static void gasLogUpdate() {
 // the tank log: once the float has actually reached near-full and near-empty,
 // commit those measured mV as the FULL/EMPTY anchors and re-linearise the
 // mids (same math as Q F/E). No manual steps — just drive the tank to both
-// ends once. Low mV = full, high mV = empty (matching gasCalMv ordering).
+// ends once. Slope-aware: with a NORMAL sender (low mV = full) FULL anchors at
+// the lowest logged mV; with an INVERTED sender (high mV = full) FULL anchors
+// at the highest logged mV — matched to whatever the manual anchors say.
 static void gasAutoCal() {
     if (s_gasLog.minPct < 0) return;              // log not seeded yet
     bool dirty = false, relin = false;
+    bool inverted = g_cfg.gasCalMv[0] > g_cfg.gasCalMv[4];
+    uint16_t fMv = inverted ? s_gasLog.maxMv : s_gasLog.minMv;   // FULL-end mv
+    uint16_t eMv = inverted ? s_gasLog.minMv : s_gasLog.maxMv;   // EMPTY-end mv
 
-    if (s_gasLog.maxPct >= 95 && s_gasLog.minMv > 1000 &&
-        s_gasLog.minMv < g_cfg.gasCalMv[0] - 50 &&
-        s_gasLog.minMv < g_cfg.gasCalMv[4]) {
-        g_cfg.gasCalMv[0] = (uint16_t)s_gasLog.minMv;       // FULL anchor
+    if (s_gasLog.maxPct >= 95 && fMv > 1000 && fMv < 32000 &&
+        fMv != g_cfg.gasCalMv[0] &&
+        (inverted ? fMv > g_cfg.gasCalMv[0] + 50 : fMv < g_cfg.gasCalMv[0] - 50)) {
+        g_cfg.gasCalMv[0] = fMv;                                   // FULL anchor
         dirty = relin = true;
         Serial.printf("gas auto-cal: F set = %u mv\n", g_cfg.gasCalMv[0]);
     }
-    if (s_gasLog.minPct <= 5 && s_gasLog.maxMv < 32000 &&
-        s_gasLog.maxMv > g_cfg.gasCalMv[4] + 50 &&
-        s_gasLog.maxMv > g_cfg.gasCalMv[0]) {
-        g_cfg.gasCalMv[4] = (uint16_t)s_gasLog.maxMv;       // EMPTY anchor
+    if (s_gasLog.minPct <= 5 && eMv > 1000 && eMv < 32000 &&
+        eMv != g_cfg.gasCalMv[4] &&
+        (inverted ? eMv < g_cfg.gasCalMv[4] - 50 : eMv > g_cfg.gasCalMv[4] + 50)) {
+        g_cfg.gasCalMv[4] = eMv;                                   // EMPTY anchor
         dirty = relin = true;
         Serial.printf("gas auto-cal: E set = %u mv\n", g_cfg.gasCalMv[4]);
     }
@@ -1108,6 +1237,12 @@ static void gasAutoCal() {
             g_cfg.gasCalMv[j] = g_cfg.gasCalMv[0] +
                 (uint16_t)((uint32_t)(g_cfg.gasCalMv[4] - g_cfg.gasCalMv[0]) * j / 4);
         Serial.println("gas auto-cal: mids re-linearised");
+    } else if (relin && g_cfg.gasCalMv[0] > g_cfg.gasCalMv[4]) {
+        // Inverted slope: mids descend from the FULL (high-mV) anchor.
+        for (uint8_t j = 1; j < 4; j++)
+            g_cfg.gasCalMv[j] = g_cfg.gasCalMv[4] +
+                (uint16_t)((uint32_t)(g_cfg.gasCalMv[0] - g_cfg.gasCalMv[4]) * j / 4);
+        Serial.println("gas auto-cal: mids re-linearised (inverted)");
     }
     if (dirty) {
         s_gasFilt = -1;                          // reseed filter after cal change
@@ -1609,29 +1744,47 @@ static void handleCommand(const String& line) {
             break;
         case 'Q':
             // Q              -> dump gas calibration + current reading
+            // Q R / Q RESET  -> wipe calibration + gas log back to stock
             // Q F / E / 1/2/3 -> record CURRENT A4 reading as FULL/EMPTY/1/4/HALF/3/4
             // Q D <0-15>     -> damping strength (0 = raw)
             // Q W <5-90>     -> low-fuel warning %
             // Q M <mpg>      -> set assumed mpg for est. miles
             // Q T <gal>      -> set tank capacity in gallons (e.g. Q T 13.2)
+            if (val == "R" || val == "RESET") {
+                memcpy(g_cfg.gasCalMv, kGasStockMv, sizeof(g_cfg.gasCalMv));
+                s_gasFilt = -1;
+                s_gasLog = GasLog{};
+                gasLogSave();
+                saveCfg();
+                Serial.println("gas cal + log reset to stock (F=1009 E=25014) - now press SET FULL at a full tank, SET EMPTY at empty");
+                break;
+            }
             if (val == "F" || val == "E" || val == "1" || val == "2" || val == "3") {
-                // Table anchors: slot0 = FULL (low mV, 100%) … slot4 = EMPTY (high mV, 0%)
+                // Table anchors: slot0 = FULL .. slot4 = EMPTY. The sender's
+                // slope is read at cal time (see gasPercent) — low mV = full OR
+                // high mV = full, both supported.
                 uint8_t slot = (val == "F") ? 0 : (val == "E") ? 4 : (uint8_t)(4 - val.toInt());
-                g_cfg.gasCalMv[slot] = readAnalogMv(3);
-                // Recording an anchor invalidates any stale mid points from a
-                // previous front end (non-monotonic table makes the piecewise
-                // interp return garbage). Re-linearise 1/4..3/4 between the
-                // anchors once BOTH are sane (c[0] < c[4]) — i.e. after the
-                // second of SET F / SET E. Explicit Q 1/2/3 refinements still
-                // win, but do them AFTER F/E or they get re-linearised.
+                uint16_t raw = readAnalogMv(3);
+                // Off-scale rejection (2026-09-20 stuck-at-full bug): an open
+                // sender reads ~60k (clamped to 60000), a dead short ~0.
+                // Recording either into an anchor poisons the table — a huge
+                // FULL anchor makes every real reading <= c[0] and the needle
+                // pins at 100% with SET EMPTY powerless. Reject + hint instead.
+                if (raw >= 30000 || raw < 1000) {
+                    Serial.printf("gas point REJECTED: %u mv off-scale (open or shorted sender?) - no cal recorded\n", raw);
+                    break;
+                }
+                g_cfg.gasCalMv[slot] = raw;
+                // Re-linearise 1/4..3/4 between the anchors whenever an anchor
+                // is (re)set. Signed math keeps it correct for BOTH slopes:
+                // c[0]<c[4] rising (low mV = full) or c[0]>c[4] falling
+                // (high mV = full). Explicit Q 1/2/3 refinements still win,
+                // but do them AFTER F/E or they get re-linearised.
                 if (slot == 0 || slot == 4) {
-                    const uint16_t *c = g_cfg.gasCalMv;
-                    if (c[0] < c[4]) {
-                        // mV rises as fuel DROPS: slot j sits j/4 of the span
-                        // above FULL (j=1 -> 3/4 tank -> +1/4 span).
+                    int32_t span = (int32_t)g_cfg.gasCalMv[4] - (int32_t)g_cfg.gasCalMv[0];
+                    if (span) {
                         for (uint8_t j = 1; j < 4; j++)
-                            g_cfg.gasCalMv[j] =
-                                c[0] + (uint16_t)((uint32_t)(c[4] - c[0]) * j / 4);
+                            g_cfg.gasCalMv[j] = (uint16_t)((int32_t)g_cfg.gasCalMv[0] + span * j / 4);
                         Serial.println("gas mids re-linearised; refine with Q 1/2/3 after F/E");
                     }
                 }
@@ -1689,6 +1842,14 @@ static void handleCommand(const String& line) {
                 Serial.printf("gas log: LO %d%% (%dmv) HI %d%% (%dmv)\n",
                               s_gasLog.minPct, s_gasLog.minMv,
                               s_gasLog.maxPct, s_gasLog.maxMv);
+            {
+                const uint16_t *gc = g_cfg.gasCalMv;
+                bool poisoned = (gc[0] >= 30000 || gc[4] >= 30000 || gc[0] < 1000 || gc[4] < 1000 || gc[0] == gc[4]);
+                if (poisoned)
+                    Serial.println("WARN: anchors off-scale/degenerate -> mapping STOCK span. Send Q R to reset, then SET FULL/SET EMPTY.");
+                else if (gc[0] > gc[4])
+                    Serial.println("note: inverted sender slope (high mV = FULL) detected");
+            }
             break;
         case 'P': {
             // P              -> report map
@@ -1956,6 +2117,8 @@ void setup() {
 
     ledInit();
 
+    speedInit();
+
     Serial.println("MS2/Extra I/O box v3 (iobox3) ready — ESP-NOW link to dash. Type ? for status.");
     Serial.println("boot link=espnow proto=ms2");
 
@@ -1994,7 +2157,9 @@ void loop() {
 
     static uint32_t dashLast = 0;
     if (now - dashLast >= DASH_TX_MS) {
+        uint32_t elapsed = now - dashLast;
         dashLast = now;
+        speedTick(elapsed);
         espnowSendStatus();
     }
 
