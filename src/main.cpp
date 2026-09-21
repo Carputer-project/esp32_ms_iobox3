@@ -1211,6 +1211,9 @@ static void gasLogUpdate() {
 // ends once. Slope-aware: with a NORMAL sender (low mV = full) FULL anchors at
 // the lowest logged mV; with an INVERTED sender (high mV = full) FULL anchors
 // at the highest logged mV — matched to whatever the manual anchors say.
+// Off-scale gate MUST match gasPercent poison + Q F/E rejection (>=30000 ||
+// <1000): real senders (~11-24k reported) never live above 30k, so a
+// floating/unplugged extreme can't be auto-committed as an anchor.
 static void gasAutoCal() {
     if (s_gasLog.minPct < 0) return;              // log not seeded yet
     bool dirty = false, relin = false;
@@ -1218,14 +1221,14 @@ static void gasAutoCal() {
     uint16_t fMv = inverted ? s_gasLog.maxMv : s_gasLog.minMv;   // FULL-end mv
     uint16_t eMv = inverted ? s_gasLog.minMv : s_gasLog.maxMv;   // EMPTY-end mv
 
-    if (s_gasLog.maxPct >= 95 && fMv > 1000 && fMv < 32000 &&
+    if (s_gasLog.maxPct >= 95 && fMv > 1000 && fMv < 30000 &&
         fMv != g_cfg.gasCalMv[0] &&
         (inverted ? fMv > g_cfg.gasCalMv[0] + 50 : fMv < g_cfg.gasCalMv[0] - 50)) {
         g_cfg.gasCalMv[0] = fMv;                                   // FULL anchor
         dirty = relin = true;
         Serial.printf("gas auto-cal: F set = %u mv\n", g_cfg.gasCalMv[0]);
     }
-    if (s_gasLog.minPct <= 5 && eMv > 1000 && eMv < 32000 &&
+    if (s_gasLog.minPct <= 5 && eMv > 1000 && eMv < 30000 &&
         eMv != g_cfg.gasCalMv[4] &&
         (inverted ? eMv < g_cfg.gasCalMv[4] - 50 : eMv > g_cfg.gasCalMv[4] + 50)) {
         g_cfg.gasCalMv[4] = eMv;                                   // EMPTY anchor
