@@ -150,7 +150,7 @@ struct Cfg {
     // ~150mV linear knee -> near-FULL readings are mushy until SET F
     // records the anchor through the same path (absorbs the offset).
     uint16_t  gasCalMv[5] = {1009, 4800, 9800, 16418, 25014}; // FULL,3/4,HALF,1/4,EMPTY
-    uint8_t  gasDamp = 0;       // EMA smoothing 0(raw)..15 — tames small-signal sender jitter
+    uint8_t  gasDamp = 5;       // EMA smoothing 0(raw)..15 — tames small-signal sender jitter; on-car default 5 (2026-09-21)
     uint8_t  lowFuelPct = 20;   // at/below this % the gas gauge flashes red
     uint8_t  gasMpg = 25;       // assumed fuel economy for est. miles remaining
     uint16_t tankGalX10 = 132;  // tank capacity in tenths-gallons (13.2 gal = 132)
