@@ -125,8 +125,8 @@ struct Cfg {
     bool    fanManual = false;
     int16_t iacTargetRpm = 900;
     uint8_t iacFailDuty = 0;
-    bool    iacAuto = true;
-    bool    iacFollow = false;
+    bool    iacAuto = false;
+    bool    iacFollow = true;               /* default idle mode = FOLLOW MS */
     uint8_t iacManualDuty = 30;
     int16_t shiftRpm = 7000;
     uint8_t outMode[7] = { OM_RPM, OM_OFF, OM_OFF, OM_OFF, OM_OFF, OM_OFF, OM_OFF };
@@ -139,7 +139,7 @@ struct Cfg {
     uint8_t fanOut = 6;
     bool    respEnable = false;
     uint8_t respId = 5;
-    bool    bootTest = false;    // AE111 install: ACC-fed boots stay quiet
+    uint8_t _pad    = 0;          // was bootTest — kept for NVS layout (sim/boottest removed)
     // Reported-mV anchors for the 220R-from-3V3 A4 front end (reported =
     // node_mV * 22.74). PROVENANCE 2026-08-23: Toyota FSM sender spec for
     // this family (AE92/Corolla + 90-93 Celica, toyotanation FSM quotes):
@@ -227,7 +227,12 @@ static uint16_t readAnalogMv(uint8_t i) {
     // wrapped to ~9.5k and the gauge read FULL on an open circuit. 60k keeps
     // A1-A3 (max ~40k at load dump) untouched; gasPercent's 32k filter cap
     // then maps 60k past the EMPTY anchor -> reads empty, the safe direction.
-    uint32_t mv = (uint32_t)(analogRead(ADC_PINS[i]) * 3300.0f / 4095.0f * ADC_DIVIDER);
+    // Oversample x8: ESP32 ADC jitter is tens of mV per sample, so one bad
+    // reading near the threshold could out-vote the latch debounce on a
+    // floating/noisy line. 8-read mean kills it; cost is ~0.3ms/ch.
+    uint32_t sum = 0;
+    for (uint8_t k = 0; k < 8; k++) sum += analogRead(ADC_PINS[i]);
+    uint32_t mv = (uint32_t)((sum / 8.0f) * 3300.0f / 4095.0f * ADC_DIVIDER);
     return (uint16_t)(mv > 60000u ? 60000u : mv);
 }
 
@@ -285,7 +290,7 @@ static void updateAnalogLatch() {
         }
         if (!g_cfg.anEnable[i]) { s_anLatch[i] = false; candCnt[i] = 0; continue; }
         int16_t t = (int16_t)g_cfg.anThresh[i];
-        int16_t mv = (int16_t)readAnalogMv(i);
+        int16_t mv = (int16_t)min(readAnalogMv(i), (uint16_t)32767);   // clamp: >32767 would cast negative
         bool raw;
         if (s_anLow[i]) {
             // GND-switched line: set at/below threshold, release above +150mV
@@ -507,7 +512,7 @@ static void espnowSendStatus() {
     // v3 frame: v2 (gas% + per-channel source-mV) + live IAC duty % in [14].
     // Dash reads only [1](latch) and [4](warn) with a len>=8 guard, so the
     // extra bytes are ignored by old receivers — fully backward compatible.
-    // Extended v4: +[15]=fanMode(0/1/2) +[16]=iacMode(0/1/2) +[17]=buzzerOn +[18]=bootTestOn
+    // Extended v4: +[15]=fanMode(0/1/2) +[16]=iacMode(0/1/2) +[17]=buzzerOn +[18]=reserved (was bootTestOn)
     // v5: [2] (was spare 0) now carries speed mph from the ABS/LM393 input.
     uint8_t f[19] = {0};
     f[0] = FRAME_STATUS;
@@ -534,7 +539,7 @@ static void espnowSendStatus() {
     else if (g_cfg.iacFollow) iacMode = 2;
     f[16] = iacMode;
     f[17] = g_cfg.buzzerEnable ? 1 : 0;
-    f[18] = g_cfg.bootTest ? 1 : 0;
+    f[18] = 0;   // reserved (bootTest removed — kept 0 for frame layout compat)
     esp_err_t r = esp_now_send(ESP_NOW_BROADCAST, f, sizeof(f));
     s_txB0Count++;
     if (r != ESP_OK) {
@@ -617,7 +622,7 @@ static void speedTick(uint32_t dtMs) {
 // never inside the ESP-NOW RX callback. Purely additive: A0/B0 formats and
 // the outpc receive path are untouched.
 //   [D0][len][cmd...]        ack + echo of the command that just ran
-//   [D0][0x01][23B snapshot] machine-readable state, sent after a remote '?'
+//   [D0][0x01][27B snapshot] machine-readable state, sent after a remote '?'
 static void espnowSendAck(const char* cmd) {
     size_t n = strlen(cmd);
     if (n > 20) n = 20;
@@ -632,7 +637,7 @@ static void espnowSendSnapshot() {
     // v2 snapshot: [2]=canFresh [3..16]=rpm,map,mat,clt,tps,batt,afr LE [17]=iac%
     // [18]=flags b0 fan b1 follow b2 auto b4 buzzing b5 eng-enabled
     // [19..20]=iacTarget [21]=O1-7 bitmask [22]=warnLatched low byte
-    // v3: +[23]=fanMode(0/1/2) +[24]=iacMode(0/1/2) +[25]=bootTestOn +[26]=reserved
+    // v3: +[23]=fanMode(0/1/2) +[24]=iacMode(0/1/2) +[25]=reserved (was bootTestOn) +[26]=reserved
     uint8_t f[27] = {0};
     auto wr16 = [&](int o, int v){ f[o] = (uint8_t)(v & 0xFF); f[o+1] = (uint8_t)((v >> 8) & 0xFF); };
     f[0] = FRAME_REPLY; f[1] = 0x01;
@@ -660,7 +665,7 @@ static void espnowSendSnapshot() {
     if (g_cfg.iacAuto) iacMode = 1;
     else if (g_cfg.iacFollow) iacMode = 2;
     f[24] = iacMode;
-    f[25] = g_cfg.bootTest ? 1 : 0;
+    f[25] = 0;   // bootTest removed — reserved
     f[26] = 0; // reserved
     esp_now_send(ESP_NOW_BROADCAST, f, sizeof(f));
 }
@@ -704,123 +709,8 @@ static void decodeOutpc() {
     if (s_groupSeen[6]) g_iacStep = rdS16(local, 54);
 }
 
-// ---- CAN-less simulation -------------------------------------------------
-// Fills the same s_outpc buffer the CAN RX path writes, so decodeOutpc,
-// engine profile, outputs, dash 0x710 and the round display all run as if an
-// ECU were broadcasting. G1 enables, G0 disables.
-static bool s_simActive = false;
-
-struct SimWp {
-    uint32_t t;      // ms from cycle start
-    uint16_t rpm;
-    int16_t  tps;    // % x10
-    int16_t  map;    // kPa x10
-    int16_t  clt;    // F x10
-    int16_t  mat;    // F x10
-    int16_t  batt;   // V x10
-    int16_t  afr;    // AFR x10
-    uint8_t  iac;    // raw 0-255
-};
-
-static const SimWp kSimWp[] = {
-    {     0,  800,    0,  400, 1800, 1200, 142, 145,  95 }, // idle warm-up
-    {  6000, 4500,  800, 1100, 1850, 1250, 138, 135,  40 }, // accel / cruise
-    { 12000, 8500,  950, 3000, 1950, 1450, 132, 115,  10 }, // boost pull -> OVERREV
-    { 18000, 7500,  900, 2600, 2050, 1600, 130, 108,  10 }, // hold, MAT rising
-    { 24000, 6500,  850, 2800, 2400, 1750, 126,  98,  10 }, // OVERHEAT + RICH
-    { 30000, 1000,    0,  600, 2100, 1300, 122, 185,  80 }, // lift-off decel (LEAN gated by TPS)
-    { 36000,  900,    0,  500, 2050, 1250, 105, 142,  95 }, // battery sag -> LOWBATT
-    { 42000,  600,    0,  450, 1950, 1200, 145, 147, 100 }, // idle hunting low -> IDLELO
-    { 48000, 1200,    0,  450, 1900, 1200, 145, 147,  90 }, // idle hunting high -> IDLEHI
-    { 60000,  800,    0,  400, 1850, 1150, 142, 145,  95 }, // settle, loop back
-};
-static constexpr uint32_t SIM_CYCLE_MS = 60000;
-
-// Boot self-test: after a settle delay, run the sim for a few seconds as a
-// power-on hardware check (fan channel, display, gauge). CLT is swept from the
-// fan off-point past the on-point so the real fan hysteresis turns the fan on
-// regardless of what thresholds are configured.
-static constexpr uint32_t BOOT_SETTLE_MS = 1000;
-static constexpr uint32_t BOOT_TEST_MS  = 3000;
-static bool     s_bootTestArmed = false;
-static bool     s_bootTestOn    = false;
-static uint32_t s_bootTestStartMs = 0;
-
-static void simInject() {
-    if (s_bootTestOn) {
-        // Boot self-test profile: sweep CLT from the fan off-point to a few
-        // degrees past the on-point so the fan hysteresis spins the fan for the
-        // tail of the window, whatever the configured setpoints are. Other
-        // channels stay calm so nothing else fires.
-        uint32_t since = millis() - s_bootTestStartMs;
-        uint32_t t = since > BOOT_SETTLE_MS ? since - BOOT_SETTLE_MS : 0;
-        if (t > BOOT_TEST_MS) t = BOOT_TEST_MS;
-        int32_t cltLo = g_cfg.fanOffTemp;
-        int32_t cltHi = g_cfg.fanOnTemp + 80;               // +8.0F
-        int32_t clt = cltLo + (cltHi - cltLo) * (int32_t)t / (int32_t)BOOT_TEST_MS;
-        uint16_t rpm = 900;
-
-        s_outpc[6] = (uint8_t)(rpm >> 8);  s_outpc[7]  = (uint8_t)(rpm & 0xFF);
-        s_outpc[18] = 0x01; s_outpc[19] = 0x90;             // map 40.0 kPa
-        s_outpc[20] = 0x04; s_outpc[21] = 0xB0;             // mat 120.0 F
-        s_outpc[22] = (uint8_t)(clt >> 8); s_outpc[23] = (uint8_t)(clt & 0xFF);
-        s_outpc[24] = 0x00; s_outpc[25] = 0x00;             // tps 0%
-        s_outpc[26] = 0x00; s_outpc[27] = 0x8E;             // batt 14.2 V
-        s_outpc[28] = 0x00; s_outpc[29] = 0x91;             // afr 14.5
-        s_outpc[54] = 0; s_outpc[55] = 95;                  // iacstep idle
-        s_groupSeen[0] = s_groupSeen[2] = s_groupSeen[3] = s_groupSeen[6] = true;
-        s_anyGroupSeen = true;
-        s_lastFrameMs = millis();
-        return;
-    }
-
-    uint32_t t = millis() % SIM_CYCLE_MS;
-    uint8_t n = sizeof(kSimWp) / sizeof(kSimWp[0]);
-    uint8_t i = 0;
-    for (uint8_t j = 0; j + 1 < n; j++) {
-        if (t < kSimWp[j + 1].t) { i = j; break; }
-    }
-    const SimWp& a = kSimWp[i];
-    const SimWp& b = kSimWp[i + 1];
-    uint32_t span = b.t - a.t;
-    uint32_t dt = t - a.t;
-
-    auto lerp = [&](int32_t av, int32_t bv) -> int32_t {
-        return av + (int32_t)((bv - av) * (int32_t)dt) / (int32_t)span;
-    };
-    uint16_t rpm = (uint16_t)lerp(a.rpm, b.rpm);
-    int16_t  tps  = (int16_t)lerp(a.tps,  b.tps);
-    int16_t  map  = (int16_t)lerp(a.map,  b.map);
-    int16_t  clt  = (int16_t)lerp(a.clt,  b.clt);
-    int16_t  mat  = (int16_t)lerp(a.mat,  b.mat);
-    int16_t  batt = (int16_t)lerp(a.batt, b.batt);
-    int16_t  afr  = (int16_t)lerp(a.afr,  b.afr);
-    uint8_t  iac  = (uint8_t)lerp(a.iac,  b.iac);
-
-    s_outpc[6] = (uint8_t)(rpm >> 8);  s_outpc[7]  = (uint8_t)(rpm & 0xFF);
-    s_outpc[18] = (uint8_t)(map >> 8); s_outpc[19] = (uint8_t)(map & 0xFF);
-    s_outpc[20] = (uint8_t)(mat >> 8); s_outpc[21] = (uint8_t)(mat & 0xFF);
-    s_outpc[22] = (uint8_t)(clt >> 8); s_outpc[23] = (uint8_t)(clt & 0xFF);
-    s_outpc[24] = (uint8_t)(tps >> 8); s_outpc[25] = (uint8_t)(tps & 0xFF);
-    s_outpc[26] = (uint8_t)(batt >> 8); s_outpc[27] = (uint8_t)(batt & 0xFF);
-    s_outpc[28] = (uint8_t)(afr >> 8); s_outpc[29] = (uint8_t)(afr & 0xFF);
-    s_outpc[54] = 0; s_outpc[55] = iac;   // iacstep is int16 big-endian (0-255)
-
-    s_groupSeen[0] = s_groupSeen[2] = s_groupSeen[3] = s_groupSeen[6] = true;
-    s_anyGroupSeen = true;
-    s_lastFrameMs = millis();
-}
-
-static void simStop() {
-    s_simActive = false;
-    memset(s_outpc, 0, sizeof(s_outpc));
-    for (bool& b : s_groupSeen) b = false;
-    s_anyGroupSeen = false;
-    g_rpm = g_map = g_mat = g_clt = g_tps = g_batt = g_afr = g_iacStep = 0;
-}
-
-// Boot self-test: after a settle delay, run the sim for a few seconds as a
-// power-on hardware check (fan channel, display, gauge).
+// CAN-less simulation and boot self-test REMOVED (never inject synthetic ECU
+// data — the box only ever mirrors real dash 0xA0 frames).
 static uint16_t s_warnRaw = 0;
 static uint32_t s_warnFirstMs = 0;
 
@@ -1147,7 +1037,10 @@ static int gasPercent() {
         if (s_gasFilt <= a && s_gasFilt >= b) {
             int hiPct = 100 - i * 25;            // % at c[i] (FULL end)
             int loPct = 100 - (i + 1) * 25;      // % at c[i+1] (EMPTY end)
-            return loPct + (int32_t)(a - s_gasFilt) * (hiPct - loPct) / (a - b);
+            /* Endpoints were swapped pre-2026-09-25: `a` is the FULL (high-mV)
+             * anchor so filt == a must yield hiPct, not loPct — the old line
+             * returned hiPct at the EMPTY end and read ~25% high per segment. */
+            return loPct + (int32_t)(s_gasFilt - b) * (hiPct - loPct) / (a - b);
         }
     }
     return 0;
@@ -1504,11 +1397,9 @@ static void loadCfg() {
 }
 
 static void reportStatus() {
-    Serial.printf("link=espnow rx_a0=%lu rx_c0=%lu tx_b0=%lu dropped=%lu sim=%d bt=%d can_fresh=%d rpm=%u map=%.1f mat=%.1fF clt=%.1fF tps=%.1f%% batt=%.1fV afr=%.1f buz=%d\n",
+    Serial.printf("link=espnow rx_a0=%lu rx_c0=%lu tx_b0=%lu dropped=%lu can_fresh=%d rpm=%u map=%.1f mat=%.1fF clt=%.1fF tps=%.1f%% batt=%.1fV afr=%.1f buz=%d\n",
                   (unsigned long)s_rxA0Count, (unsigned long)s_rxC0Count, (unsigned long)s_txB0Count,
                   (unsigned long)s_rxDroppedCount,
-                  s_simActive ? 1 : 0,
-                  g_cfg.bootTest ? 1 : 0,
                   s_canFresh ? 1 : 0, g_rpm,
                   g_map / 10.0f, g_mat / 10.0f, g_clt / 10.0f,
                   g_tps / 10.0f, g_batt / 10.0f, g_afr / 10.0f,
@@ -1722,29 +1613,6 @@ static void handleCommand(const String& line) {
             Serial.println("proto=ms2 link=espnow");
             break;
         }
-        case 'G':
-            // G              -> report sim state
-            // G 1            -> CAN-less simulation on
-            // G 0            -> simulation off, clear synthetic data
-            if (val == "1") {
-                s_simActive = true;
-                simInject();
-            } else if (val == "0") {
-                simStop();
-            }
-            Serial.printf("sim=%d\n", s_simActive ? 1 : 0);
-            break;
-        case 'Z':
-            // Z              -> report boot self-test
-            // Z 1|0          -> enable/disable 3s fan+sim boot test
-            if (val == "1" || val == "0") {
-                g_cfg.bootTest = val == "1";
-                saveCfg();
-                Serial.printf("boottest=%d\n", g_cfg.bootTest ? 1 : 0);
-            } else {
-                Serial.printf("boottest=%d (Z 1|0 to change)\n", g_cfg.bootTest ? 1 : 0);
-            }
-            break;
         case 'Q':
             // Q              -> dump gas calibration + current reading
             // Q R / Q RESET  -> wipe calibration + gas log back to stock
@@ -2059,7 +1927,7 @@ static void handleCommand(const String& line) {
             else Serial.println("X0=pullup-hiz X1=float X2=3v3 X3=gnd(beep) X9=auto");
             break;
         default:
-            Serial.println("commands: ? | M | G[0|1] | Z[0|1] | P[IAC <pin>|O<n> <pin>|TFTS/TFTM/TFTC/TFTD <pin>|BZ <pin>|TFT 0|1|RESET] | Q[F|E <mv>|M <mpg>|T <gal>] | F[onTempF|A|1|0] | E[offTempF] | I[duty|A|F] | T[targetRpm] | Y[fanOut 1-7|0] | S[shiftRpm] | O<n>[0|1|T<f>|R<rpm>] | A<n>[0|H<v>|L<v>|O<k> <v>|F <v>|<v>] | R | W[0|1|idle|maxrpm|clt|mat|batt|map|afr|hold|warnout|help] | B[0|1|T]");
+            Serial.println("commands: ? | M | P[IAC <pin>|O<n> <pin>|TFTS/TFTM/TFTC/TFTD <pin>|BZ <pin>|TFT 0|1|RESET] | Q[F|E <mv>|M <mpg>|T <gal>] | F[onTempF|A|1|0] | E[offTempF] | I[duty|A|F] | T[targetRpm] | Y[fanOut 1-7|0] | S[shiftRpm] | O<n>[0|1|T<f>|R<rpm>] | A<n>[0|H<v>|L<v>|O<k> <v>|F <v>|<v>] | R | W[0|1|idle|maxrpm|clt|mat|batt|map|afr|hold|warnout|help] | B[0|1|T]");
             break;
     }
 }
@@ -2124,31 +1992,9 @@ void setup() {
 
     Serial.println("MS2/Extra I/O box v3 (iobox3) ready — ESP-NOW link to dash. Type ? for status.");
     Serial.println("boot link=espnow proto=ms2");
-
-    if (g_cfg.bootTest) {
-        s_bootTestArmed = true;
-        s_bootTestStartMs = millis();
-        Serial.println("boottest: armed (sim 3s after settle)");
-    }
 }
 
 void loop() {
-    // Boot self-test: settle -> run sim for a few seconds -> stop.
-    if (s_bootTestArmed) {
-        uint32_t since = millis() - s_bootTestStartMs;
-        if (!s_bootTestOn && since >= BOOT_SETTLE_MS) {
-            s_bootTestOn = true;
-            s_simActive = true;
-            Serial.println("boottest: sim on");
-        } else if (s_bootTestOn && since >= BOOT_SETTLE_MS + BOOT_TEST_MS) {
-            s_bootTestOn = false;
-            s_bootTestArmed = false;
-            simStop();
-            Serial.println("boottest: done");
-        }
-    }
-
-    if (s_simActive) simInject();
     s_canFresh = s_anyGroupSeen && (millis() - s_lastFrameMs) < FAILSAFE_MS;
     decodeOutpc();
     updateAnalogLatch();
@@ -2195,19 +2041,21 @@ void loop() {
         static bool badLine = false;
         while (Serial.available()) {
             char ch = (char)Serial.read();
-            if (ch == '\n') {
-                // GPIO3 floats when no USB host is attached and picks up
-                // harness noise as random bytes -> junk lines that used to
-                // trigger "?)" hints / beep / help spam. Discard them here:
-                // zero extra CPU (the bytes are received+parsed regardless),
-                // we just skip responding to lines with non-printables.
-                if (!badLine && line.length()) handleCommand(line);
+            if (ch == '\n' || ch == '\r') {
+                // '\r' OR '\n' ends a line: some tools (minicom, screen)
+                // send CR-only, which used to be ignored -> a probe got NO
+                // reply forever. GPIO3 also floats when no USB host is
+                // attached and picks up harness noise as random bytes — those
+                // junk lines used to trigger "?)" hints / beep / help spam.
+                // Discard lines with non-printables; answer clean ones with a
+                // prompt so any probe always gets an immediate ack.
+                if (!badLine && line.length()) { handleCommand(line); Serial.print("> "); }
                 line = "";
                 badLine = false;
-            }
-            else if (ch != '\r') {
+            } else {
                 if (ch < 32 || ch > 126) badLine = true;   // non-printable = noise
-                else if (line.length() < 128) line += ch;  // cap: flood can't grow heap
+                else if (line.length() >= 128) { line = ""; badLine = false; line += ch; }  // junk flood: drop the flood, keep the char that overflowed it
+                else line += ch;
             }
         }
     }
