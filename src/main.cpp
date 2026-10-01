@@ -1266,11 +1266,18 @@ static void gasLogUpdate() {
     // is a real tank level. Only log inside the sender's live window.
     if (mv < 1000 || mv >= 32000) return;
     if (pct < 0 || pct > 100) return;
+    // Track the extremes observed under the CURRENT table, BEFORE the
+    // first-boot seeding branch below — that branch returns early, so anything
+    // written after it is skipped on exactly the sample that first populates the
+    // log. Putting it here also means the seed observation counts as an
+    // observation: on a first boot / after `Q R` / after `P WIPE` with the tank
+    // already near full, the >=95% reading must arm the FULL gate, or the gate
+    // stays disarmed until the tank returns to full a second time.
+    if (pct > s_fullPctSinceCal)  { s_fullPctSinceCal  = (int8_t)pct; s_fullMvSinceCal  = (int16_t)mv; }
+    if (pct < s_emptyPctSinceCal) { s_emptyPctSinceCal = (int8_t)pct; s_emptyMvSinceCal = (int16_t)mv; }
     if (s_gasLog.minPct < 0) {
         s_gasLog.minPct = s_gasLog.maxPct = (int8_t)pct;
         s_gasLog.minMv  = s_gasLog.maxMv  = (int16_t)mv;
-        s_fullMvSinceCal  = (pct >= 95) ? (int16_t)mv : -1;
-        s_emptyMvSinceCal = (pct <= 5)  ? (int16_t)mv : -1;
         gasLogSave();
         return;
     }
