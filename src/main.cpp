@@ -2150,7 +2150,11 @@ static void handleCommand(const String& line) {
                 saveDiagMac();
                 s_gasLog = GasLog{};
                 gasLogSave();
-                for (uint8_t i = 0; i < 4; i++) { s_anForce[i] = -1; s_anLatch[i] = false; }
+                for (uint8_t i = 0; i < 4; i++) {
+                    s_anForce[i] = -1;          // bench override
+                    s_anLow[i]   = false;       // saved polarity — THIS is what
+                    s_anLatch[i] = false;       //   saveAnPol() actually persists
+                }
                 saveAnPol();
                 s_dashMacHinted = false;
                 applyPinConfig();
