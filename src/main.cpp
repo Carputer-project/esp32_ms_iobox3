@@ -47,6 +47,10 @@ static constexpr uint8_t PIN_SPEED = 5;      // ABS speed input (LM393 -> PCNT) 
 static constexpr uint8_t  CAN_GROUP_COUNT = 9;   // outpc groups (72 bytes) carried in 0xA0
 static constexpr uint16_t DASH_TX_MS = 100;
 static constexpr uint32_t FAILSAFE_MS = 500;
+// Fuel-sender sampling rate, 20 Hz. Fixed (not per-loop-pass) so that gasDamp is
+// a real time constant: (gasDamp+1) x GAS_SAMPLE_MS. See the gasSampleMv() call
+// in loop() for why per-pass was wrong in both directions.
+static constexpr uint16_t GAS_SAMPLE_MS = 50;
 // A1-A4 input dividers: 100k top (signal->pin) + 4.6k bottom (pin->GND).
 // readAnalogMv() reports SOURCE mV: pin_mV * (Rtop+Rbot)/Rbot.
 static constexpr float    ADC_R_TOP_OHM = 100000.0f;   // 2026-08-22: front-end rework — all channels 100k series
@@ -2501,11 +2505,33 @@ void setup() {
 void loop() {
     s_canFresh = s_anyGroupSeen && (millis() - s_lastFrameMs) < FAILSAFE_MS;
     decodeOutpc();
-    // Sample the fuel sender ONCE per iteration, before any consumer. Every
+    // Sample the fuel sender on a FIXED cadence, before any consumer, so every
     // reader below (0xB0 frame, gas log, gas display, low-fuel buzzer test,
-    // Serial status) maps this one sample, so they can never disagree and the
-    // EMA advances at a rate set by loop() alone. See gasSampleMv().
-    gasSampleMv();
+    // Serial status) maps the same sample and they can never disagree.
+    //
+    // Fixed cadence, not once per loop() pass. Two reasons:
+    //
+    //  - gasDamp has to mean a time constant, and that only holds if the sample
+    //    RATE is fixed. Once per pass made it (gasDamp+1) x loop_period, and
+    //    this same batch made loop_period wildly variable: a TFT re-init step
+    //    runs ~300 ms, and gasLogUpdate can commit to NVS (a flash erase) on a
+    //    new extreme. The damping would change by 5x depending on whether the
+    //    display was being re-initialised.
+    //  - Per pass it also over-sampled. Before the split, the EMA advanced only
+    //    when a consumer asked, which on a running car was ~30-40 advances/s.
+    //    Once per pass is ~100-160/s, so the on-car default gasDamp=5 — chosen
+    //    on 2026-09-21 specifically to tame sender jitter — silently went from
+    //    a ~170 ms time constant to ~40-60 ms, i.e. 3-5x LESS smoothing, and the
+    //    needle started showing the jitter the setting exists to remove.
+    //
+    // 20 Hz: (gasDamp+1) x 50 ms = a 300 ms time constant at the on-car default.
+    // Slightly slower than the accidental old rate, which is the right direction
+    // for a fuel gauge, and now it is a number you can reason about.
+    static uint32_t gasLast = 0;
+    if (millis() - gasLast >= GAS_SAMPLE_MS) {
+        gasLast = millis();
+        gasSampleMv();
+    }
     updateAnalogLatch();
     updateEngineProfile();
     updateOutputs();
