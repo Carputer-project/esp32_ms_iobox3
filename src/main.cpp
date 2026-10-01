@@ -321,6 +321,7 @@ static void outputsOff() {
 
 static void handleCommand(const String& line);
 static bool pinOk(uint8_t p);
+static bool pinAliasFree(uint8_t p, int skip_idx);
 // ---------------------------------------------------------------------------
 // Clock backlight LED bar (WS2812-type addressable, 6 LEDs) on GPIO4.
 // RMT one-shot TX; sends only on change so ESP-NOW timing is untouched.
@@ -806,20 +807,34 @@ static void updateOutputs() {
     bool engineRunning = s_groupSeen[0] && g_rpm > 300;
     bool cltReadable  = s_groupSeen[2] && g_clt > 100 && g_clt < 3500;
     bool cltHot       = cltReadable && g_clt >= g_cfg.fanOnTemp;
+    bool fanHoldOn    = false;   /* minimum-on hold while the link is down */
 
     if (!linkFresh) {
         if (!s_fanHeldAfterLinkLoss) { s_fanHeldAfterLinkLoss = true; s_fanOffAtMs = millis(); }
         bool withinRunOn = (millis() - s_fanOffAtMs) < FAN_RUNON_MS;
 
-        if (engineRunning && (cltHot || withinRunOn)) {
-            setFan(true);
-            // Fan stays on; the normal control pass below continues and keeps
-            // the emergency override, output modes and IAC all live.
-        } else {
+        /* Note on cltReadable: it requires s_groupSeen[2], so a frame that
+         * omitted group 2 makes cltHot false. That is correct for the warning
+         * path (do not act on absent data) but must NOT disable cooling: if the
+         * last known coolant was hot, keep cooling until we can prove it is not.
+         * So cltHot for the FAILSAFE uses the raw g_clt regardless of the
+         * group-seen flag, guarded only by a sane range. */
+        bool cltHotForFail = (g_clt > 100 && g_clt < 3500 && g_clt >= g_cfg.fanOnTemp);
+
+        fanHoldOn = engineRunning && (cltHotForFail || withinRunOn);
+
+        if (!fanHoldOn) {
             outputsOff();
-            return;   // nothing running: full off, and the normal pass has
-                      // nothing useful to add.
+            /* Engine stopped or cool and the run-on has expired: everything off.
+             * Close the IAC too -- there is no engine to stall. */
+            setIac(g_cfg.iacFailDuty);
+            return;
         }
+        /* Engine is running: fall through to the normal control pass so the
+         * emergency overheat override and inputForces() remain reachable, and
+         * OR fanHoldOn into fanOn below. Never write setFan() here: the normal
+         * pass ends in setFan(fanOn) and would overwrite it microseconds later,
+         * which turned this hold into a ~150 Hz spike train on the gate. */
         if (!engineRunning || (cltReadable && g_clt <= g_cfg.fanOnTemp)) {
             setIac(g_cfg.iacFailDuty);
         }
@@ -870,6 +885,12 @@ static void updateOutputs() {
     // runs hotter than 180 nominal in any mode.
     if (cltOk && clt >= g_cfg.fanOnTemp) fanOn = true;
     fanOn = fanOn || inputForces(7);
+    // Link-lost minimum-on hold: keep the fan driven after the ESP-NOW link
+    // drops so a flapping link cannot strobe it, and so a warm engine stays
+    // cooled through the dropout. Uses the raw g_clt (not the s_groupSeen[2]-
+    // gated cltOk) because the whole point is to keep cooling when the last
+    // frame did not carry coolant data.
+    if (fanHoldOn) fanOn = true;
     setFan(fanOn);
 
     for (uint8_t i = 0; i < 7; i++) {
@@ -1418,7 +1439,7 @@ static void initGasTft() {
     }
     s_gasTft->begin();
     s_gasTft->setRotation(1);
-    s_gasTft->fillScreen(GC9A01A_BLACK);
+    /* No fillScreen(): drawGasFrame() begins with one. See initTft(). */
     drawGasFrame();
 }
 
@@ -1437,7 +1458,12 @@ static void initTft() {
         }
         s_tft->begin();
         s_tft->setRotation(1);   // content upright when screen mounted pins-right
-        s_tft->fillScreen(GC9A01A_BLACK);
+        /* No fillScreen() here: drawGaugeFrame() starts with one. Two fills back
+         * to back over SOFTWARE SPI cost ~180 ms each (Adafruit_SPITFT has no
+         * fast path unless connection == TFT_HARD_SPI, so every pixel is 16
+         * iterations x 3 digitalWrite() calls). Both displays use -1 for reset,
+         * so begin() is ~300 ms each on its own. Dropping one redundant fill
+         * saved ~180 ms of a 1.3 s stall. */
         drawGaugeFrame();
         s_lastDuty[0] = s_lastRpm[0] = s_lastTgt[0] = s_lastClt[0] = 0;
         s_lastMode[0] = s_lastStat[0] = s_lastWarn[0] = 0;
@@ -1887,7 +1913,41 @@ static void handleCommand(const String& line) {
             String k = val.substring(0, sp);
             int pin = val.substring(sp + 1).toInt();
             k.trim();
-            if (!pinOk(pin)) { Serial.println("pin rejected: unusable on WROOM-32"); break; }
+            /* Range-check BEFORE the uint8_t narrowing in pinOk(). pinOk()
+             * takes a uint8_t, so 'P IAC 275' used to validate GPIO19 and
+             * silently store 19 while reporting the input as a bad pin -- the
+             * rejection message was unreachable for any aliased value. */
+            if (pin < 0 || pin > 39 || !pinOk((uint8_t)pin)) {
+                Serial.println("pin rejected: not a usable output on WROOM-32 (0-39, no strapping/flash/input-only/owned pins)");
+                break;
+            }
+            /* Aliasing check. pinOk() proves the pin is legal; this proves it is
+             * not already spoken for. Skip the entry being reassigned so
+             * 'P O2 <same pin>' stays a no-op instead of failing. */
+            int skipIdx = -1;
+            if (k == "IAC")        skipIdx = -2;   /* iac: nothing to skip, always check all */
+            else if (k.length() == 2 && k[0] == 'O') skipIdx = (int)(uint8_t)(k[1] - '1');
+            if (skipIdx == -2) {
+                if (!pinAliasFree((uint8_t)pin, -1)) {
+                    Serial.println("pin rejected: already used by another output/IAC/buzzer/LED/speed/gas pin");
+                    break;
+                }
+            } else if (skipIdx >= 0 && skipIdx <= 6) {
+                if (!pinAliasFree((uint8_t)pin, skipIdx)) {
+                    Serial.printf("pin rejected: GPIO%u already in use by another mapped pin\n", pin);
+                    break;
+                }
+            } else if (skipIdx > 6) {
+                Serial.println("P O<n> <pin>, n=1..7");
+                break;
+            } else {
+                /* The TFT SCLK/MOSI/CS/DC and BZ pins must also not collide
+                 * with the actuator pins. */
+                if (!pinAliasFree((uint8_t)pin, -1)) {
+                    Serial.println("pin rejected: already used by an output/IAC/buzzer/LED/speed/gas pin");
+                    break;
+                }
+            }
             if (k == "IAC") {
                 g_cfg.pin.iac = (uint8_t)pin;
             } else if (k.length() == 2 && k[0] == 'O') {
@@ -1997,12 +2057,55 @@ static void handleCommand(const String& line) {
 
 static bool pinOk(uint8_t p) {
     if (p == 0 || p == 1 || p == 3) return false;          // boot strap / UART0 console
-    if (p == 2) return false;                               // onboard LED
+    if (p == 2) return false;                               // GAS_CS (hardcoded, :30)
     if (p >= 6 && p <= 11) return false;                    // flash pins / dead
     if (p == 20 || p == 24) return false;                   // dead
     if (p >= 28 && p <= 31) return false;                   // dead
-    if (p == 34 || p == 35 || p == 36 || p == 39) return false; // input-only
+    /* Input-only GPIOs on the bare ESP32. 37 and 38 were MISSING from this
+     * list: they have no output driver either, so 'P IAC 37' validated, RMT/
+     * LEDC attached successfully, and the IAC gate was never driven -- a
+     * silently dead idle-air valve with "pin map updated" reported. */
+    if (p >= 34 && p <= 39) return false;                   // 34,35,36,37,38,39
+    /* Pins owned by subsystems with no way to re-point them:
+     *   4  = LED_DATA_DEF, WS2812 bar. ledInit() installs RMT on it and there
+     *        is NO 'P LED' command, so assigning an output here is a one-way
+     *        trap: RMT and setOut() then fight over the pin and the bar can
+     *        never be moved again without a reflash.
+     *   5  = PIN_SPEED, the ABS/LM393 input configured for PCNT in
+     *        speedInit(). Making it an output fights the open-collector
+     *        comparator and the speed reading becomes garbage.
+     *   15 = GAS_SCLK, 16 = GAS_MOSI, 21 = GAS_DC — the idle display's
+     *        software-SPI pins are hardcoded at :28-31. */
+    if (p == 4 || p == 5 || p == 15 || p == 16 || p == 21) return false;
     return p <= 39;
+}
+
+/* Aliasing check: pinOk() only proves a pin is legal and free of the
+ * hardcoded pins above. It does not stop an output from being re-pointed onto
+ * ANOTHER output, onto the LEDC-driven IAC pin, or onto the buzzer pin. Those
+ * all write the same output register, so setOut() (digitalWrite) and
+ * setIac()/updateBuzzer() (LEDC/direct) end up driving one wire at ~250 Hz
+ * from two places — last writer wins, so a load the firmware believes is OFF is
+ * energised most of the time. Two commands cause it: 'P O2 13' (13 is out[0]'s
+ * default) or 'P IAC 13'.
+ *
+ * NOTE the buzzer is active-LOW, which makes 'P BZ 13' worse than a fight: it
+ * holds out[0] HIGH for 900 ms and LOW for 100 ms, forever — an indicator relay
+ * stuck on from a plausible typo.
+ *
+ * This validates the PROPOSED pin against everything it must not collide with.
+ * Returns false if p is already used by iac/buzz/ledData/speed/gas, or by any
+ * other out[] entry other than out[skip_idx]. */
+static bool pinAliasFree(uint8_t p, int skip_idx) {
+    if (p == g_cfg.pin.iac  && skip_idx != -1) return false;
+    if (p == g_cfg.pin.buzz && skip_idx != -1) return false;
+    if (p == g_cfg.pin.ledData) return false;
+    if (p == PIN_SPEED || p == GAS_SCLK || p == GAS_MOSI || p == GAS_CS || p == GAS_DC) return false;
+    for (int i = 0; i < 7; i++) {
+        if (i == skip_idx) continue;
+        if (g_cfg.pin.out[i] == p) return false;
+    }
+    return true;
 }
 
 static void applyPinConfig() {
