@@ -169,6 +169,10 @@ static constexpr uint8_t kIacDuty[8]  = { 60, 55, 50, 45, 40, 35, 30, 28 };
 
 static Cfg        g_cfg;
 static Preferences g_prefs;
+// False when NVS failed to mount. Every get then returns a default and every put
+// is a silent no-op, which is indistinguishable from "empty" unless the callers
+// check this explicitly.
+static bool s_nvsOk = true;
 static const char* const kPrefsName = "iobox";
 
 static uint8_t  s_outpc[72];
@@ -1727,14 +1731,24 @@ static void loadCfg() {
     // indistinguishable from a brand-new box: same defaults, same silence, and
     // a calibrated gas table, a pin map and the engine profile simply gone with
     // nothing on the console to say so.
-    bool present = g_prefs.isKey("cfg");
-    size_t len   = g_prefs.getBytes("cfg", &g_cfg, sizeof(g_cfg));
+    bool present = s_nvsOk && g_prefs.isKey("cfg");
+    size_t len   = s_nvsOk ? g_prefs.getBytes("cfg", &g_cfg, sizeof(g_cfg)) : 0;
 
     if (len != sizeof(g_cfg) || g_cfg.magic != CFG_MAGIC) {
         bool magicBad = (len == sizeof(g_cfg) && g_cfg.magic != CFG_MAGIC);
         g_cfg = Cfg{};
         saveCfg();
-        if (!present) {
+        if (!s_nvsOk) {
+            // Must be checked FIRST. Without this the NVS-open failure reported
+            // "no stored config — first boot, defaults written", which is the one
+            // message that tells the user their settings are safe. It was a lie:
+            // NVS never opened, nothing was read and nothing can be written, so
+            // every setting from the last session is already gone and will not
+            // come back on the next reboot. Two of my own diagnostics then
+            // contradicted each other on the console at the same boot.
+            Serial.println("cfg: NOT LOADED — NVS is not open, so this is not a first boot.");
+            Serial.println("     Stored settings are unavailable this session and will be lost.");
+        } else if (!present) {
             Serial.printf("cfg: no stored config — first boot, defaults written (magic %04x)\n", CFG_MAGIC);
         } else if (magicBad) {
             Serial.printf("cfg: STALE CONFIG — stored magic is not %04x, defaults written.\n"
@@ -2517,6 +2531,7 @@ void setup() {
     // so the box would run on defaults and quietly DISCARD every setting the
     // user made for the rest of the session, with nothing on the console.
     if (!g_prefs.begin(kPrefsName, false)) {
+        s_nvsOk = false;
         Serial.println("FATAL: NVS 'iobox' failed to open — settings cannot be saved or loaded.");
         Serial.println("      Running on defaults. All changes this session will be LOST.");
         Serial.println("      Check free flash and that the NVS partition exists.");
