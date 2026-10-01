@@ -1360,6 +1360,11 @@ static void drawGasNeedle(float deg, uint16_t color) {
 static char s_lastGasMv[12] = "";
 static char s_lastGasPct[8] = "";
 static uint16_t s_lastPctColor = 0xFFFF;
+// Last-drawn float-history band (LO%/HI% of the tank log), -2 = nothing drawn.
+// File scope, not a local of updateGasDisplay(), so drawGasFrame() can clear it:
+// the tracker is delta-based and must be invalidated whenever the panel is
+// filled, or the band is gone until the lifetime min/max next moves.
+static int16_t s_bandMin = -2, s_bandMax = -2;
 static char s_lastGasLow[10] = "";
 static uint16_t s_lastLowColor = 0xFFFF;
 static char s_lastGasLo[8] = "";
@@ -1441,6 +1446,16 @@ static void drawGasFrame() {
     s_lastGasMv[0] = s_lastGasPct[0] = s_lastGasLow[0] = s_lastGasLo[0] = s_lastGasHi[0] = 0;
     s_lastGasLoMv[0] = s_lastGasHiMv[0] = 0;
     s_lastPctColor = s_lastLowColor = 0xFFFF;
+    // The float-history band is static-delta-tracked, so it MUST be invalidated
+    // here or it is lost for the life of the frame. It used to be a
+    // function-local static inside updateGasDisplay(): that survived the
+    // fillScreen() above, so after ANY re-init drawGasFrame() wiped the yellow
+    // band off the panel while the delta tracker still believed it was drawn —
+    // the band then never came back until the float's lifetime min or max
+    // happened to change. Worse, the "erase the previous band" loop would then
+    // scribble dark ticks over a region that had just been filled, for a band
+    // that no longer existed.
+    s_bandMin = s_bandMax = -2;
 }
 
 static void updateGasDisplay() {
@@ -1501,7 +1516,6 @@ static void updateGasDisplay() {
     // Min/Max tank-float log: a yellow band on the tick ring tracing the
     // sweep the float has covered (from LO% up to HI%). The needle already
     // shows the live level, so the band reads instantly with no text.
-    static int16_t s_bandMin = -2, s_bandMax = -2;
     int16_t bMin = s_gasLog.minPct, bMax = s_gasLog.maxPct;
     if (bMin != s_bandMin || bMax != s_bandMax) {
         if (s_bandMin >= 0) {            // erase previous band
@@ -1595,11 +1609,28 @@ enum TftStep : uint8_t {
     TFT_STEP_GAS_FRAME,
 };
 static TftStep s_tftStep = TFT_IDLE;
+static bool    s_tftReinitAgain = false;
 
-/* Ask for a re-init. Returns immediately; the work happens in loop(). Coalesces:
- * several pin changes in a row cost one re-init, not one each. */
+/* Ask for a re-init. Returns immediately; the work happens in loop().
+ *
+ * Requests that arrive while a sequence is in flight are LATCHED, not dropped.
+ * The original version coalesced by simply ignoring them, which was wrong: the
+ * steps read g_cfg.pin.tft* LAZILY, at their own alloc step, not here. So a
+ * `P TFTC 13` landing at or after TFT_STEP_GAS_ALLOC changed the pin in NVS,
+ * printed "pin map updated", and was then silently discarded — while the gas
+ * display went on driving the OLD CS pin. Nothing re-queued it, the sequence ran
+ * to TFT_IDLE, and the state looked settled.
+ *
+ * Reachable over the 0xC0 path: the queue is 6 deep and now drains one command
+ * per pass, so a burst of pin commands is consumed across ~1.8 s of sequence and
+ * any of them landing past its own alloc step was lost. The 0xD0 ack still said
+ * the command succeeded.
+ *
+ * Latching instead re-runs the whole sequence from teardown on completion, so
+ * the final state always matches the config that is actually stored. */
 static void tftReinitRequest() {
     if (s_tftStep == TFT_IDLE) s_tftStep = TFT_STEP_TEARDOWN;
+    else                        s_tftReinitAgain = true;
 }
 
 static void tftIdleAlloc() {
@@ -1618,6 +1649,20 @@ static void tftGasAlloc() {
 }
 
 /* One step per call. Deliberately NOT called from handleCommand(). */
+/* Terminal transition for the re-init state machine. Re-arms from teardown if a
+ * request landed while the sequence was in flight, so the final state always
+ * matches the config that is actually stored. All paths that end the sequence
+ * must go through here rather than assigning TFT_IDLE directly. */
+static void tftReinitDone() {
+    if (s_tftReinitAgain) {
+        s_tftReinitAgain = false;
+        s_tftStep = TFT_STEP_TEARDOWN;
+        Serial.println("tft re-init: restart (config changed mid-sequence)");
+    } else {
+        s_tftStep = TFT_IDLE;
+    }
+}
+
 static void tftReinitStep() {
     /* Re-check tftEnable on EVERY step, not just at teardown. The steps run one
      * per loop() pass, so `P TFT 0` typed during the gas half used to leave the
@@ -1626,7 +1671,7 @@ static void tftReinitStep() {
      * to as well or it quietly diverges from them. */
     if (s_tftStep != TFT_IDLE && s_tftStep != TFT_STEP_TEARDOWN && !g_cfg.tftEnable) {
         teardownTft();
-        s_tftStep = TFT_IDLE;
+        tftReinitDone();
         Serial.println("tft re-init cancelled (tft disabled mid-sequence)");
         return;
     }
@@ -1634,6 +1679,8 @@ static void tftReinitStep() {
         case TFT_IDLE: return;                       // nothing pending
         case TFT_STEP_TEARDOWN:
             teardownTft();
+            // No latched request can survive into a fresh teardown: tftReinitDone()
+            // already consumed it to get here.
             s_tftStep = g_cfg.tftEnable ? TFT_STEP_IDLE_ALLOC : TFT_IDLE;
             return;
         case TFT_STEP_IDLE_ALLOC:                    // new(): ~0 ms, no SPI
@@ -1641,7 +1688,7 @@ static void tftReinitStep() {
             s_tftStep = TFT_STEP_IDLE_BEGIN;
             return;
         case TFT_STEP_IDLE_BEGIN:                    // ~300 ms — the worst step
-            if (!s_tft) { s_tftStep = TFT_IDLE; Serial.println("tft re-init aborted: idle display alloc failed"); return; }
+            if (!s_tft) { tftReinitDone(); Serial.println("tft re-init aborted: idle display alloc failed"); return; }
             s_tft->begin();
             s_tft->setRotation(1);
             s_tftStep = TFT_STEP_IDLE_FRAME;
@@ -1657,15 +1704,15 @@ static void tftReinitStep() {
             s_tftStep = TFT_STEP_GAS_BEGIN;
             return;
         case TFT_STEP_GAS_BEGIN:                     // ~300 ms
-            if (!s_gasTft) { s_tftStep = TFT_IDLE; Serial.println("tft re-init aborted: gas display alloc failed"); return; }
+            if (!s_gasTft) { tftReinitDone(); Serial.println("tft re-init aborted: gas display alloc failed"); return; }
             s_gasTft->begin();
             s_gasTft->setRotation(1);
             s_tftStep = TFT_STEP_GAS_FRAME;
             return;
         case TFT_STEP_GAS_FRAME:                     // ~180 ms
             drawGasFrame();
-            s_tftStep = TFT_IDLE;
-            Serial.println("tft re-init complete");
+            tftReinitDone();
+            if (s_tftStep == TFT_IDLE) Serial.println("tft re-init complete");
             return;
     }
 }
