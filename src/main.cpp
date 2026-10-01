@@ -1108,9 +1108,12 @@ static void gasSampleMv() {
     s_gasFilt = (int16_t)constrain(f, 0, 32000);
 }
 
-/* Pure mapping: s_gasFilt -> percent. No ADC read, no side effect. Safe to
- * call any number of times from any number of places. */
-static int gasPctFromFilt() {
+/* Pure mapping: an mV reading -> percent, against the current calibration.
+ * No ADC read, no side effect. Safe to call any number of times from anywhere.
+ * Takes the mV explicitly rather than reading s_gasFilt, so it can also re-score
+ * an already-recorded mV against a table that has since changed (see
+ * gasLogRescore). */
+static int gasPctFromMv(int16_t mv) {
     // Stuck-at-full poison guard (2026-09-20): a SET F pressed while the
     // sender was unplugged recorded the ~60k clamp into the FULL anchor, and
     // every real reading (11.3k-23.5k) is then <= c[0] -> needle pinned at
@@ -1126,14 +1129,14 @@ static int gasPctFromFilt() {
     for (uint8_t i = 0; i < 5; i++) c[i] = src[i];
 
     if (c[0] < c[4]) {   // normal slope: low mV = full, high mV = empty
-        if (s_gasFilt <= c[0]) return 100;
-        if (s_gasFilt >= c[4]) return 0;
+        if (mv <= c[0]) return 100;
+        if (mv >= c[4]) return 0;
         for (uint8_t i = 0; i < 4; i++) {
-            if (s_gasFilt <= c[i + 1]) {
+            if (mv <= c[i + 1]) {
                 int hiPct = 100 - i * 25;         // % at c[i]
                 int loPct = 100 - (i + 1) * 25;   // % at c[i+1]
                 if (c[i + 1] == c[i]) return hiPct;
-                return loPct + (int32_t)(c[i + 1] - s_gasFilt) * (hiPct - loPct) / (c[i + 1] - c[i]);
+                return loPct + (int32_t)(c[i + 1] - mv) * (hiPct - loPct) / (c[i + 1] - c[i]);
             }
         }
         return 0;
@@ -1144,22 +1147,24 @@ static int gasPctFromFilt() {
     // low-mV anchor. Without this branch an inverted sender pins at 100%
     // forever — every paired SET F/SET E re-records the same high/low anchors
     // and the FULL-first check above never lets the needle fall.
-    if (s_gasFilt >= c[0]) return 100;
-    if (s_gasFilt <= c[4]) return 0;
+    if (mv >= c[0]) return 100;
+    if (mv <= c[4]) return 0;
     for (uint8_t i = 0; i < 4; i++) {
         uint16_t a = c[i], b = c[i + 1];         // a >= b along the slope
         if (a == b) continue;
-        if (s_gasFilt <= a && s_gasFilt >= b) {
+        if (mv <= a && mv >= b) {
             int hiPct = 100 - i * 25;            // % at c[i] (FULL end)
             int loPct = 100 - (i + 1) * 25;      // % at c[i+1] (EMPTY end)
             /* Endpoints were swapped pre-2026-09-25: `a` is the FULL (high-mV)
              * anchor so filt == a must yield hiPct, not loPct — the old line
              * returned hiPct at the EMPTY end and read ~25% high per segment. */
-            return loPct + (int32_t)(s_gasFilt - b) * (hiPct - loPct) / (a - b);
+            return loPct + (int32_t)(mv - b) * (hiPct - loPct) / (a - b);
         }
     }
     return 0;
 }
+
+static inline int gasPctFromFilt() { return gasPctFromMv(s_gasFilt); }
 
 // Min/Max tank-float log: lowest & highest readings ever seen, in BOTH
 // damped mv and the resulting %. Lives under its OWN NVS key ("gaslog") so
@@ -1186,6 +1191,35 @@ static void gasLogLoad() {
     if (len != sizeof(s_gasLog) || s_gasLog.magic != GASLOG_MAGIC) {
         s_gasLog = GasLog{};   // unseeded; first plausible read owns min=max
     }
+}
+
+/* Re-derive the logged PERCENTAGES from the logged mV against the CURRENT
+ * calibration.
+ *
+ * minMv/maxMv are calibration-independent — they are physical sender voltages.
+ * minPct/maxPct are not: they are what the table in force at the time said.
+ * gasAutoCal() changes that table (F/E anchors plus a full re-linearisation of
+ * the mids), which silently invalidated every percentage already in the log.
+ *
+ * That mattered because those same stale percentages are the auto-cal gates:
+ * `maxPct >= 95` and `minPct <= 5` decide whether an anchor may be committed.
+ * A log recorded against a stretched table could hold a maxPct of 95 that the
+ * new table would never produce, so an EMPTY anchor could be committed against
+ * an mV the tank never actually reached.
+ *
+ * The mV are the trustworthy half, so recompute the percentages from them.
+ * Returns true if anything changed, so the caller can decide to persist. */
+static bool gasLogRescore() {
+    if (s_gasLog.minPct < 0) return false;   // unseeded; nothing to re-score
+    if (s_gasLog.minMv < 0 || s_gasLog.maxMv < 0) return false;
+    int loPct = constrain(gasPctFromMv(s_gasLog.maxMv), 0, 100);  // low  mV
+    int hiPct = constrain(gasPctFromMv(s_gasLog.minMv), 0, 100);  // high mV
+    // mV and % run opposite ways on a normal sender, so don't assume an order.
+    if (loPct > hiPct) { int t = loPct; loPct = hiPct; hiPct = t; }
+    if (loPct == s_gasLog.minPct && hiPct == s_gasLog.maxPct) return false;
+    s_gasLog.minPct = (int8_t)loPct;
+    s_gasLog.maxPct = (int8_t)hiPct;
+    return true;
 }
 
 static void gasLogUpdate() {
@@ -1270,6 +1304,11 @@ static void gasAutoCal() {
     }
     if (dirty) {
         s_gasFilt = -1;                          // reseed filter after cal change
+        // The table just moved, so the percentages in the log now describe a
+        // calibration that no longer exists — and they are this function's own
+        // gates on the next pass. Re-derive them from the recorded mV, which are
+        // physical and unaffected by the table.
+        if (gasLogRescore()) gasLogSave();
         saveCfg();
     }
 }
@@ -1793,6 +1832,12 @@ static void handleCommand(const String& line) {
                     }
                 }
                 s_gasFilt = -1;                     // reseed filter after cal change
+                // Same reason as the auto-cal path: the table moved, so the log's
+                // percentages are now against a calibration that no longer exists
+                // and are gasAutoCal()'s gates on its next pass. The mV are the
+                // trustworthy half. ('Q R' above needs no rescore — it wipes the
+                // log outright.)
+                if (gasLogRescore()) gasLogSave();
                 saveCfg();
                 Serial.printf("gas point %u = %u mv\n", slot, g_cfg.gasCalMv[slot]);
                 break;
