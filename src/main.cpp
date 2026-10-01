@@ -1844,52 +1844,82 @@ static void reportStatus() {
  * loop(), so the flag cannot leak into a subsequent Serial command. */
 static bool s_cmdFromLink = false;
 
-/* Commands that change persistent configuration, rewire which GPIO drives
- * which actuator, or take manual control of an output. All UART-console only.
+/* ALLOW-LIST of what may arrive over the unauthenticated ESP-NOW 0xC0 channel.
+ * Everything else is UART-console only.
  *
- * The original version of this list held only `P DASH` / `P DIAG`. That was
- * wrong in a way the fix's own threat model should have caught: peerAllowed()
- * accepts ANY peer when nothing is bound, which is the default, so a single
- * broadcast 0xC0 frame reached every one of these. It refused the weakest
- * command on the list and left the rest wide open — including `P WIPE`, which
- * this same campaign added and which is strictly more destructive than the
- * attack the list was written to close.
+ * This was a deny-list twice and was wrong twice, which is the argument for an
+ * allow-list: a deny-list can only be as complete as the author's memory of
+ * every command in the file, and two review passes each found one it had missed.
+ *  - pass 1 caught `P WIPE` (a remote factory reset, worse than the peer-filter
+ *    attack the list was written to close).
+ *  - pass 2 caught `Y 0`. `Y <n>` picks which output the fan runs on, and
+ *    `Y 0` is one frame that removes the fan from the board permanently: setFan()
+ *    is `if (fanOut >= 1 && fanOut <= 7) digitalWrite(...)`, so fanOut == 0
+ *    writes NOTHING — and the emergency overheat override upstream,
+ *    `if (clt >= fanOnTemp) fanOn = true`, still sets fanOn and still calls
+ *    setFan(), so every downstream safety path believes cooling is being driven
+ *    while no pin is touched. Silent, persistent, survives reboot. Also missed:
+ *    `O<n>` (output mode, can latch any of the 7 relays on), `A<n>` (an analog
+ *    input can be mapped onto any output, another way to drive the fan relay),
+ *    `W` (the whole engine-warning profile, including `W 0` to switch the
+ *    OVERHEAT warning off), and `B L` (continuous horn, which the dash never
+ *    sends — it only sends `B 0`, `B 1` and `B T`).
  *
- * Every entry below has the same shape: one frame reverts something the user
- * dialled in, or moves a relay to a different pin, and the 0xD0 ack still says
- * "ok". None of them is a command the dash ever sends — can_tx.c emits only
- * F, I, T, Q, B and L, and nothing else in the workspace transmits 0xC0 — so
- * refusing the whole group costs nothing.
+ * peerAllowed() accepts ANY peer when nothing is bound, which is the default,
+ * so all of the above were reachable by one broadcast frame from anything in
+ * radio range, and the 0xD0 ack still said "ok".
  *
- * The real fix for all of this is encryption + frame authentication on the
- * ESP-NOW link (still open, as D4/io-H2). Until then this is a deny-list
- * because the set of genuinely-remote commands is small and known. */
-static bool cmdIsUartOnly(char key, const String& val) {
+ * The allowed set is exactly what can_tx.c emits — F, I, T, Q, B, L — and
+ * nothing else in the workspace transmits 0xC0 at all.
+ *
+ * RESIDUAL, not fixed here: `F 0` (fan off), `I 0` (manual 0% IAC), `B 0`
+ * (buzzer mute) and `Q W 90` (low-fuel warning at 90%) are legitimate DASH
+ * buttons, so they stay reachable, and each one remotely disables a function the
+ * driver relies on. Closing those needs a real fix — an encrypted,
+ * authenticated ESP-NOW link (D4 / io-H2, still open) — not a longer list. Do
+ * not read this function as making the link safe. */
+static bool cmdAllowedFromLink(char key, const String& val) {
     switch (key) {
-        // Entire family refused, not just peer binding:
-        //   P IAC/O<n>/BZ/TFTS/TFTM/TFTC/TFTD  remap which GPIO drives what,
-        //                                      incl. moving the fan relay
-        //   P TFT 0|1                            turn the displays on/off
-        //   P RESET                              wipe the pin map
-        //   P DASH/P DIAG                        persist a peer filter that can
-        //                                      lock the real dash out and stop
-        //                                      cooling the engine
-        //   P WIPE                               full factory reset
-        case 'P':
+        // F A|1|0   fan auto / manual on / manual off
+        // I F|A|<d> IAC follow MS / closed loop / manual duty
+        // T <rpm>   closed-loop idle target
+        case 'F':
+        case 'I':
+        case 'T':
             return true;
-        // X 0..3 takes manual control of the buzzer pin and holds it. X 3 is a
-        // continuous horn with no automatic exit, so a remote X 3 is a remote
-        // horn that only X 9 stops — and an attacker who drives it to X 3 first
-        // can then ignore X 9 arriving.
-        case 'X':
-            return true;
-        // Only the gas-table-writers. The dash legitimately sends Q D / Q W /
-        // Q M / Q T (damping, low-fuel %, mpg, tank size) and those still work.
-        //   Q R          wipes the calibration to stock
-        //   Q F/E/1/2/3  record the CURRENT A4 reading as a table anchor
+        // Q is the only mixed one: the dash sends Q D/W/M/T (damping, low-fuel %,
+        // mpg, tank size) and Q alone dumps state. Everything else on this key
+        // writes the calibration table — Q R wipes it, Q F/E/1/2/3 records the
+        // current A4 reading as an anchor — and must not be reachable from the
+        // air. Prefix match on "<letter><space>" rather than an exact-value deny
+        // list, so a new Q subcommand added later is refused by default.
         case 'Q':
-            return val == "R" || val == "RESET" || val == "F" || val == "E" ||
-                   val == "1" || val == "2" || val == "3";
+            return val.length() == 0 ||
+                   val.startsWith("D ") || val.startsWith("W ") ||
+                   val.startsWith("M ") || val.startsWith("T ");
+        // B 0|1|T    buzzer off / on / one test beep — all dash buttons.
+        // B L (continuous horn until stopped) is not; the dash has no such
+        // button, so refusing it costs nothing.
+        case 'B':
+            return !val.startsWith("L");
+        // L 0        LED bar off
+        // L <r> <g> <b>  LED bar colour
+        case 'L':
+            return true;
+        // Everything below is UART-console only:
+        //   P *        remap pins, move the fan relay, turn the TFTs off, reset
+        //              the pin map, bind a peer filter (which can lock the real
+        //              dash out and stop cooling), full factory reset
+        //   X 0..3     take the buzzer pin under manual control; X 3 is a
+        //              continuous horn with no automatic exit
+        //   Y 0..7     which output the fan runs on. Y 0 = NO FAN AT ALL, see above
+        //   O 0..6     per-output mode; can latch any of the 7 relays on
+        //   A 1..4     analog input enable/threshold/polarity/output-map. Can
+        //              drive an OUTPUT from an input, including the fan relay
+        //   W          the whole engine-warning profile, incl. W 0 = overheat
+        //              warning off
+        //   S <rpm>    shift-light output
+        //   R, M       informational, but also not needed remotely
         default:
             return false;
     }
@@ -1905,8 +1935,10 @@ static void handleCommand(const String& line) {
     String val = c.substring(1);
     val.trim();
 
-    if (s_cmdFromLink && cmdIsUartOnly(key, val)) {
-        Serial.printf("REFUSED '%s' — UART-console only. It rewires actuators or wipes stored settings.\n",
+    if (s_cmdFromLink && !cmdAllowedFromLink(key, val)) {
+        Serial.printf("REFUSED '%s' over ESP-NOW — UART-console only. It rewires actuators,\n"
+                      "         silences a warning, or wipes stored settings. The link is not\n"
+                      "         authenticated, so this is refused by default rather than trusted.\n",
                       c.c_str());
         return;
     }
