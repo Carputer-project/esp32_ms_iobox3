@@ -822,18 +822,41 @@ static void updateOutputs() {
      * for >1 s. So an ordinary ECU reset, a dash reboot, or a second of LVGL
      * task starvation on the dash reaches this path.
      *
-     * This used to be an unconditional outputsOff() + setIac(0) + early return,
-     * which had two defects:
-     *   1. The early return skipped the emergency overheat override further down
-     *      ("a disabled fan can never kill the engine on a hot day"), making
-     *      that line unreachable in exactly the case it exists for.
-     *   2. No minimum-on time, so a flapping link could strobe the fan, and the
-     *      IAC was slammed shut even when the engine was warm (a stall risk a
-     *      cooling fan does not offset).
+     * This path has been rewritten twice and was still wrong both times, in the
+     * same way: it tried to handle link loss by RETURNING EARLY, and everything
+     * past the return was therefore unreachable in exactly the case it exists
+     * for. Three consequences, all real:
+     *   1. The emergency overheat override ("a disabled fan can never kill the
+     *      engine on a hot day") was stranded whenever fanHoldOn came out
+     *      false, which includes a stalled engine at high coolant temp.
+     *   2. inputForces() was stranded, and that is the ONLY path that drives
+     *      the turn indicators and high beam from A1-A3. Those are the car's
+     *      own flasher pulses and headlamp feed on GPIO36/39/34 - they have
+     *      nothing to do with the dash. A >=5 s dropout switched off indicators
+     *      that were wired, powered and pulsing correctly.
+     *   3. It called setIac(g_cfg.iacFailDuty), and iacFailDuty is never
+     *      written by anything - grep finds only the "= 0" default and these
+     *      two call sites. So it was permanently setIac(0) -> ledcWrite(0,0),
+     *      and per the note on setIac() 0% is the CLOSED stop (94% is
+     *      mechanical full-open). With the engine idling warm and the link down
+     *      for more than FAN_RUNON_MS, that slammed the rotary ISC shut and
+     *      re-applied it every pass. Its justifying comment read "there is no
+     *      engine to stall" - but engineRunning was TRUE, and true is the only
+     *      way to reach that branch. A comment asserting the opposite of the
+     *      guard that precedes it.
      *
-     * Now: hold the fan ON while the engine is running until FAN_RUNON_MS has
-     * elapsed, keep the overheat override reachable, and only close the IAC when
-     * the engine is stopped or genuinely cold. */
+     * There is now NO early return. Link loss selects a different set of
+     * actions; it does not skip the pass:
+     *   - cooling keeps its run-on hold and still reaches the overheat override
+     *   - the local A1-A3 inputs keep driving their relays
+     *   - link-derived output modes (OM_TEMP/OM_RPM) are suppressed, because
+     *     the outpc payload is frozen and acting on it would be acting on
+     *     stale data. OM_MAN is a local decision and is honoured.
+     *   - the IAC is HELD, not closed, whenever the engine is running. Holding
+     *     means not writing it: the LEDC register keeps its last commanded
+     *     duty, which is the best guess available with no data. Only a stopped
+     *     engine gets iacFailDuty.
+     */
     bool linkFresh = s_canFresh;
     bool engineRunning = groupSeen(0) && g_rpm > 300;
     bool cltReadable  = groupSeen(2) && g_clt > 100 && g_clt < 3500;
@@ -852,23 +875,7 @@ static void updateOutputs() {
          * group-seen flag, guarded only by a sane range. */
         bool cltHotForFail = (g_clt > 100 && g_clt < 3500 && g_clt >= g_cfg.fanOnTemp);
 
-        fanHoldOn = engineRunning && (cltHotForFail || withinRunOn);
-
-        if (!fanHoldOn) {
-            outputsOff();
-            /* Engine stopped or cool and the run-on has expired: everything off.
-             * Close the IAC too -- there is no engine to stall. */
-            setIac(g_cfg.iacFailDuty);
-            return;
-        }
-        /* Engine is running: fall through to the normal control pass so the
-         * emergency overheat override and inputForces() remain reachable, and
-         * OR fanHoldOn into fanOn below. Never write setFan() here: the normal
-         * pass ends in setFan(fanOn) and would overwrite it microseconds later,
-         * which turned this hold into a ~150 Hz spike train on the gate. */
-        if (!engineRunning || (cltReadable && g_clt <= g_cfg.fanOnTemp)) {
-            setIac(g_cfg.iacFailDuty);
-        }
+        fanHoldOn = cltHotForFail || withinRunOn;
     } else {
         s_fanHeldAfterLinkLoss = false;
     }
@@ -927,23 +934,44 @@ static void updateOutputs() {
     for (uint8_t i = 0; i < 7; i++) {
         if ((i + 1) == g_cfg.fanOut) continue;
         bool on = false;
-        switch (g_cfg.outMode[i]) {
-            case OM_OFF:  on = false; break;
-            case OM_MAN:  on = g_cfg.outManual[i]; break;
-            case OM_TEMP: on = cltOk && clt >= g_cfg.outTemp[i]; break;
-            case OM_RPM:  on = groupSeen(0) && g_rpm >= g_cfg.outRpm[i]; break;
+        /* Link down: OM_TEMP/OM_RPM read a frozen outpc payload, so honouring
+         * them means acting on stale data. OM_MAN is a local operator decision
+         * with no dependency on the ECU and is kept. */
+        if (linkFresh) {
+            switch (g_cfg.outMode[i]) {
+                case OM_OFF:  on = false; break;
+                case OM_MAN:  on = g_cfg.outManual[i]; break;
+                case OM_TEMP: on = cltOk && clt >= g_cfg.outTemp[i]; break;
+                case OM_RPM:  on = groupSeen(0) && g_rpm >= g_cfg.outRpm[i]; break;
+            }
+        } else if (g_cfg.outMode[i] == OM_MAN) {
+            on = g_cfg.outManual[i];
         }
+        /* inputForces() is honoured on BOTH paths and always was the point:
+         * A1-A3 are local car wires, not dash data. */
         on = on || inputForces(i + 1);
         setOut(i, on);
     }
 
-    if (g_cfg.eng.warnOut >= 1 && g_cfg.eng.warnOut <= 7 &&
+    /* Frozen warning data must not drive the warn relay at 2 Hz forever. */
+    if (linkFresh && g_cfg.eng.warnOut >= 1 && g_cfg.eng.warnOut <= 7 &&
         g_cfg.eng.warnOut != g_cfg.fanOut && s_warnLatched) {
         bool blink = ((millis() / 500) & 1) == 0;
         setOut(g_cfg.eng.warnOut - 1, blink);
     }
 
+    /* Link down + engine running: HOLD the valve. The correct action with no
+     * data is no action - the LEDC register keeps its last commanded duty.
+     * Writing iacFailDuty here is what closed a warm idling engine's idle air
+     * after a link dropout; the "engine stopped, so closing is safe" branch is
+     * the ONLY case where that value is defensible. */
+    if (!linkFresh && engineRunning) return;
+
     uint8_t duty;
+    if (!linkFresh) {
+        setIac(g_cfg.iacFailDuty);   /* engine stopped: no idle to stall */
+        return;
+    }
     if (g_cfg.iacFollow && groupSeen(6)) {
         duty = (uint8_t)constrain((int16_t)(g_iacStep * 100 / 255), 0, 100);
     } else if (g_cfg.iacAuto || (g_cfg.iacFollow && !groupSeen(6))) {
