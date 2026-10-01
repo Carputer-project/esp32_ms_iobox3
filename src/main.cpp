@@ -2362,7 +2362,13 @@ static void handleCommand(const String& line) {
                 tftReinitRequest();
                 Serial.println("FACTORY RESET: cfg + gas table + gas log + peer filters + A1-A4 polarity");
                 Serial.println("              + LED bar + buzzer overrides, all back to defaults.");
-                Serial.println("              Reboot not required.");
+                if (s_nvsOk) {
+                    Serial.println("              Reboot not required.");
+                } else {
+                    // True today, false on the next boot: every put above was a
+                    // no-op. Do not let the message promise a persistent reset.
+                    Serial.println("              *** NVS IS NOT OPEN — NONE OF THIS WILL SURVIVE A REBOOT. ***");
+                }
                 break;
             }
             if (val == "TFT 1" || val == "TFT 0") {
@@ -2616,6 +2622,14 @@ void setup() {
     }
     loadCfg();
     gasLogLoad();
+    // Re-score the log's percentages against the table that was actually loaded.
+    // Normally a no-op (they were scored against this same table when written),
+    // but loadCfg() can have just replaced the table wholesale — a magic bump or
+    // a corrupt blob falls back to defaults while the gas log survives in its own
+    // NVS key. Without this the float-history band is drawn from percentages that
+    // describe a calibration that no longer exists, and nothing would correct it
+    // until the tank next reached a new lifetime extreme.
+    if (s_nvsOk && gasLogRescore()) gasLogSave();
     loadDashMac();
     loadDiagMac();
     loadAnPol();
