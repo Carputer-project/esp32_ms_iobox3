@@ -1095,6 +1095,11 @@ static void updateDisplay() {
 }
 
 static int16_t s_gasFilt = -1;   // damped reported-mV, -1 = uninitialised
+// mV of the most recent sample that mapped to >=95% / <=5% UNDER THE CURRENT
+// table; -1 = not seen since the table last moved. These are the auto-cal gates
+// (see gasLogUpdate). Deliberately NOT the lifetime log extremes.
+static int16_t s_fullMvSinceCal  = -1;
+static int16_t s_emptyMvSinceCal = -1;
 
 /* The ONLY function that reads the ADC and advances the EMA. Called exactly
  * once per loop() iteration, from loop(), before any consumer runs.
@@ -1209,16 +1214,16 @@ static void gasLogLoad() {
  *
  * minMv/maxMv are calibration-independent — they are physical sender voltages.
  * minPct/maxPct are not: they are what the table in force at the time said.
- * gasAutoCal() changes that table (F/E anchors plus a full re-linearisation of
- * the mids), which silently invalidated every percentage already in the log.
+ * gasAutoCal() and `Q F/E/1/2/3` move that table, which silently invalidated
+ * every percentage already in the log, so recompute them from the recorded mV
+ * (which are physical and table-independent).
  *
- * That mattered because those same stale percentages are the auto-cal gates:
- * `maxPct >= 95` and `minPct <= 5` decide whether an anchor may be committed.
- * A log recorded against a stretched table could hold a maxPct of 95 that the
- * new table would never produce, so an EMPTY anchor could be committed against
- * an mV the tank never actually reached.
+ * These percentages are DISPLAY ONLY. The auto-commit gates used to read them,
+ * which meant a log recorded against a stretched table could report maxPct 95
+ * that the new table would never produce. That is now handled separately: the
+ * gates use s_fullMvSinceCal / s_emptyMvSinceCal, which only record observations
+ * made under the CURRENT table, and are cleared whenever it changes.
  *
- * The mV are the trustworthy half, so recompute the percentages from them.
  * Returns true if anything changed, so the caller can decide to persist. */
 static bool gasLogRescore() {
     if (s_gasLog.minPct < 0) return false;   // unseeded; nothing to re-score
@@ -1257,6 +1262,8 @@ static void gasLogUpdate() {
     if (s_gasLog.minPct < 0) {
         s_gasLog.minPct = s_gasLog.maxPct = (int8_t)pct;
         s_gasLog.minMv  = s_gasLog.maxMv  = (int16_t)mv;
+        s_fullMvSinceCal  = (pct >= 95) ? (int16_t)mv : -1;
+        s_emptyMvSinceCal = (pct <= 5)  ? (int16_t)mv : -1;
         gasLogSave();
         return;
     }
@@ -1265,6 +1272,13 @@ static void gasLogUpdate() {
     if (pct > s_gasLog.maxPct) { s_gasLog.maxPct = (int8_t)pct; changed = true; }
     if (mv  < s_gasLog.minMv)  { s_gasLog.minMv  = (int16_t)mv; changed = true; }
     if (mv  > s_gasLog.maxMv)  { s_gasLog.maxMv  = (int16_t)mv; changed = true; }
+    // Track whether the CURRENT table has ever actually been observed at an
+    // extreme. These are the only inputs to the auto-commit gates — deliberately
+    // NOT lifetime minPct/maxPct, which gasLogRescore() recomputes from the
+    // current table and which therefore describe the CURRENT mapping of a
+    // historical voltage rather than a fresh observation.
+    if (pct >= 95) s_fullMvSinceCal  = (int16_t)mv;
+    if (pct <= 5)  s_emptyMvSinceCal = (int16_t)mv;
     if (changed) gasLogSave();
 
     gasAutoCal();
@@ -1281,23 +1295,29 @@ static void gasLogUpdate() {
 // <1000): real senders (~11-24k reported) never live above 30k, so a
 // floating/unplugged extreme can't be auto-committed as an anchor.
 static void gasAutoCal() {
+    // Gate on observations made under the CURRENT table, not on the lifetime
+    // log extremes. minPct/maxPct are recomputed by gasLogRescore() whenever the
+    // table moves, so after `Q E 18000` the log's maxPct could read 100 purely
+    // because the NEW table maps an old mid-tank voltage below the new EMPTY
+    // anchor — and auto-cal would then immediately overwrite the anchor the
+    // operator just typed, from a tank that had not moved. Requiring a fresh
+    // <=5% / >=95% observation under the current table fixes that whole class,
+    // not just the manual-anchor case.
     if (s_gasLog.minPct < 0) return;              // log not seeded yet
     bool dirty = false, relin = false;
     bool inverted = g_cfg.gasCalMv[0] > g_cfg.gasCalMv[4];
-    uint16_t fMv = inverted ? s_gasLog.maxMv : s_gasLog.minMv;   // FULL-end mv
-    uint16_t eMv = inverted ? s_gasLog.minMv : s_gasLog.maxMv;   // EMPTY-end mv
+    int32_t fMv = s_fullMvSinceCal;               // mV of a >=95% observation
+    int32_t eMv = s_emptyMvSinceCal;              // mV of a <=5%  observation
 
-    if (s_gasLog.maxPct >= 95 && fMv > 1000 && fMv < 30000 &&
-        fMv != g_cfg.gasCalMv[0] &&
+    if (fMv > 1000 && fMv < 30000 && fMv != g_cfg.gasCalMv[0] &&
         (inverted ? fMv > g_cfg.gasCalMv[0] + 50 : fMv < g_cfg.gasCalMv[0] - 50)) {
-        g_cfg.gasCalMv[0] = fMv;                                   // FULL anchor
+        g_cfg.gasCalMv[0] = (uint16_t)fMv;                         // FULL anchor
         dirty = relin = true;
         Serial.printf("gas auto-cal: F set = %u mv\n", g_cfg.gasCalMv[0]);
     }
-    if (s_gasLog.minPct <= 5 && eMv > 1000 && eMv < 30000 &&
-        eMv != g_cfg.gasCalMv[4] &&
+    if (eMv > 1000 && eMv < 30000 && eMv != g_cfg.gasCalMv[4] &&
         (inverted ? eMv < g_cfg.gasCalMv[4] - 50 : eMv > g_cfg.gasCalMv[4] + 50)) {
-        g_cfg.gasCalMv[4] = eMv;                                   // EMPTY anchor
+        g_cfg.gasCalMv[4] = (uint16_t)eMv;                         // EMPTY anchor
         dirty = relin = true;
         Serial.printf("gas auto-cal: E set = %u mv\n", g_cfg.gasCalMv[4]);
     }
@@ -1315,10 +1335,13 @@ static void gasAutoCal() {
     }
     if (dirty) {
         s_gasFilt = -1;                          // reseed filter after cal change
-        // The table just moved, so the percentages in the log now describe a
-        // calibration that no longer exists — and they are this function's own
-        // gates on the next pass. Re-derive them from the recorded mV, which are
-        // physical and unaffected by the table.
+        // The gates are "observations under the current table", and the table
+        // just moved, so whatever was seen under the old one no longer counts.
+        s_fullMvSinceCal  = -1;
+        s_emptyMvSinceCal = -1;
+        // The percentages in the log are now displayed against a calibration
+        // that no longer exists; re-derive them from the recorded mV so the band
+        // matches the needle. (They are no longer used as gates.)
         if (gasLogRescore()) gasLogSave();
         saveCfg();
     }
@@ -2060,6 +2083,8 @@ static void handleCommand(const String& line) {
                 memcpy(g_cfg.gasCalMv, kGasStockMv, sizeof(g_cfg.gasCalMv));
                 s_gasFilt = -1;
                 s_gasLog = GasLog{};
+                s_fullMvSinceCal  = -1;   // table moved; old observations don't count
+                s_emptyMvSinceCal = -1;
                 gasLogSave();
                 saveCfg();
                 Serial.println("gas cal + log reset to stock (F=1009 E=25014) - now press SET FULL at a full tank, SET EMPTY at empty");
@@ -2095,11 +2120,15 @@ static void handleCommand(const String& line) {
                     }
                 }
                 s_gasFilt = -1;                     // reseed filter after cal change
-                // Same reason as the auto-cal path: the table moved, so the log's
-                // percentages are now against a calibration that no longer exists
-                // and are gasAutoCal()'s gates on its next pass. The mV are the
-                // trustworthy half. ('Q R' above needs no rescore — it wipes the
-                // log outright.)
+                // The auto-cal gates are "seen >=95% / <=5% under the CURRENT
+                // table", so they are void the moment the table moves. Without
+                // this, a `Q E 18000` could be immediately overwritten by
+                // auto-cal from the very reading the operator just rejected.
+                s_fullMvSinceCal  = -1;
+                s_emptyMvSinceCal = -1;
+                // The log's percentages now describe a calibration that no longer
+                // exists; re-derive them from the recorded mV so the band matches
+                // the needle. ('Q R' above needs no rescore — it wipes the log.)
                 if (gasLogRescore()) gasLogSave();
                 saveCfg();
                 Serial.printf("gas point %u = %u mv\n", slot, g_cfg.gasCalMv[slot]);
@@ -2278,6 +2307,9 @@ static void handleCommand(const String& line) {
                 // on s_buzzManual, so applyPinConfig() alone does NOT release it.
                 s_buzzManual = false;
                 s_buzzLoop   = false;
+                s_fullMvSinceCal  = -1;
+                s_emptyMvSinceCal = -1;
+                s_gasFilt = -1;
                 applyPinConfig();
                 // Same trap on the backlight: g_cfg.ledOn is now false, but the
                 // WS2812 bar keeps emitting the pre-wipe colour until the next `L`
