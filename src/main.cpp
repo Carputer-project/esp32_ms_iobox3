@@ -1720,9 +1720,14 @@ static void tftReinitStep() {
         case TFT_IDLE: return;                       // nothing pending
         case TFT_STEP_TEARDOWN:
             teardownTft();
-            // No latched request can survive into a fresh teardown: tftReinitDone()
-            // already consumed it to get here.
-            s_tftStep = g_cfg.tftEnable ? TFT_STEP_IDLE_ALLOC : TFT_IDLE;
+            if (g_cfg.tftEnable) s_tftStep = TFT_STEP_IDLE_ALLOC;
+            // Must go through tftReinitDone() even on the disabled path: a request
+            // latched during the teardown step itself (e.g. `P TFT 0` arriving on
+            // the pass after `P TFTC 13`) is still set here, and assigning
+            // TFT_IDLE directly stranded it. The next unrelated re-init would then
+            // run the full ~1 s sequence twice and print "config changed
+            // mid-sequence" when nothing had. Self-healing, but wrong.
+            else                 tftReinitDone();
             return;
         case TFT_STEP_IDLE_ALLOC:                    // new(): ~0 ms, no SPI
             tftIdleAlloc();
