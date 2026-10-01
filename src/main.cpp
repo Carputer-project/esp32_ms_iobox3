@@ -758,6 +758,18 @@ static uint16_t engineWarnFlags() {
 }
 
 static void updateEngineProfile() {
+    /* 'W 0' (eng.enabled == false) must actually silence the warning system.
+     * g_cfg.eng.enabled was read in exactly three places -- the '?' report, the
+     * 0xD0 snapshot flag, and the two setters -- and never gated
+     * engineWarnFlags(). So after W 0 every warning still computed, the buzzer
+     * still beeped, and eng.warnOut kept blinking its relay. */
+    if (!g_cfg.eng.enabled) {
+        s_warnRaw = 0;
+        s_warnLatched = 0;
+        /* stop any latch-driven buzz via updateBuzzer() below: with no
+         * latched warning and eng.enabled false it will not retrigger */
+        return;
+    }
     s_warnRaw = engineWarnFlags();
     if (s_warnRaw) {
         if (!s_warnLatched) s_warnFirstMs = millis();
@@ -767,12 +779,54 @@ static void updateEngineProfile() {
     }
 }
 
+static uint32_t s_fanOffAtMs = 0;            /* when the fan was last commanded off */
+static bool     s_fanHeldAfterLinkLoss = false;
+
 static void updateOutputs() {
-    if (!s_canFresh) {
-        outputsOff();
-        setIac(g_cfg.iacFailDuty);
-        return;
+    /* Link-lost failsafe.
+     *
+     * s_canFresh goes false 500 ms after the dash stops sending a non-zero
+     * mask, and the dash zeroes its mask as soon as ITS CAN receive goes stale
+     * for >1 s. So an ordinary ECU reset, a dash reboot, or a second of LVGL
+     * task starvation on the dash reaches this path.
+     *
+     * This used to be an unconditional outputsOff() + setIac(0) + early return,
+     * which had two defects:
+     *   1. The early return skipped the emergency overheat override further down
+     *      ("a disabled fan can never kill the engine on a hot day"), making
+     *      that line unreachable in exactly the case it exists for.
+     *   2. No minimum-on time, so a flapping link could strobe the fan, and the
+     *      IAC was slammed shut even when the engine was warm (a stall risk a
+     *      cooling fan does not offset).
+     *
+     * Now: hold the fan ON while the engine is running until FAN_RUNON_MS has
+     * elapsed, keep the overheat override reachable, and only close the IAC when
+     * the engine is stopped or genuinely cold. */
+    bool linkFresh = s_canFresh;
+    bool engineRunning = s_groupSeen[0] && g_rpm > 300;
+    bool cltReadable  = s_groupSeen[2] && g_clt > 100 && g_clt < 3500;
+    bool cltHot       = cltReadable && g_clt >= g_cfg.fanOnTemp;
+
+    if (!linkFresh) {
+        if (!s_fanHeldAfterLinkLoss) { s_fanHeldAfterLinkLoss = true; s_fanOffAtMs = millis(); }
+        bool withinRunOn = (millis() - s_fanOffAtMs) < FAN_RUNON_MS;
+
+        if (engineRunning && (cltHot || withinRunOn)) {
+            setFan(true);
+            // Fan stays on; the normal control pass below continues and keeps
+            // the emergency override, output modes and IAC all live.
+        } else {
+            outputsOff();
+            return;   // nothing running: full off, and the normal pass has
+                      // nothing useful to add.
+        }
+        if (!engineRunning || (cltReadable && g_clt <= g_cfg.fanOnTemp)) {
+            setIac(g_cfg.iacFailDuty);
+        }
+    } else {
+        s_fanHeldAfterLinkLoss = false;
     }
+
     int16_t clt = g_clt;
     bool cltOk = s_groupSeen[2] && clt > 100 && clt < 3500;
 
@@ -1074,8 +1128,17 @@ static void gasLogLoad() {
 }
 
 static void gasLogUpdate() {
-    int mv  = s_gasFilt;
+    // Both values must come from the SAME sample. gasPercent() is a write
+    // function: it advances the EMA and assigns s_gasFilt as a side effect. So
+    // reading `mv = s_gasFilt` BEFORE calling it yielded the previous sample's
+    // mV alongside this sample's percent. On a momentary sender dropout
+    // (connector bounce, ignition blip) the node railed, pct became 0, and the
+    // stale-but-valid mid-tank mv sailed through the plausibility gate below.
+    // minPct was then latched to 0 permanently in NVS, which also unlocked
+    // gasAutoCal()'s EMPTY-anchor rewrite (gated on minPct <= 5) against a
+    // mid-tank mV. 'Q R' was the only way to clear it.
     int pct = gasPercent();
+    int mv  = s_gasFilt;
     // Plausibility gate: a dead/disconnected sender rails to the 32000 clamp
     // (open node ~75k) and reads 0%, a hard short reads ~0 and 100% — neither
     // is a real tank level. Only log inside the sender's live window.
