@@ -348,6 +348,31 @@ static void outputsOff() {
  * Deliberately a separate parameter from skip_idx - see pinAliasFree(). */
 enum : uint8_t { PINASSIGN_NONE = 0, PINASSIGN_IAC, PINASSIGN_BZ };
 
+/* True only if s is a complete, non-empty decimal integer (optional leading
+ * minus).
+ *
+ * This exists because String::toInt() returns 0 for anything it cannot parse,
+ * so `Y fan`, `Y on`, `Y -` and `I abc` all arrive as 0 - and 0 is a VALID and
+ * destructive value for exactly those two commands:
+ *   Y: fanOut = 0 means "no fan output", and setFan() writes nothing at
+ *      fanOut == 0, so every downstream path believes cooling is being driven
+ *      while no pin is touched. This is the io-C1 regression reopened by a
+ *      different door: c2b28de fixed the fanOut == 0 symptom and left the
+ *      toInt() -> 0 route into it wide open.
+ *   I: 0 is a legal idle-air duty, so garbage silently parks the valve shut.
+ *
+ * Testing the parsed RESULT cannot distinguish "the operator typed 0" from
+ * "the operator typed rubbish", so the string has to be validated first. */
+static bool argIsInt(const String& s) {
+    if (s.length() == 0) return false;
+    for (unsigned i = 0; i < s.length(); i++) {
+        char c = s[i];
+        if (c == '-' && i == 0 && s.length() > 1) continue;
+        if (c < '0' || c > '9') return false;
+    }
+    return true;
+}
+
 static void handleCommand(const String& line);
 static bool pinOk(uint8_t p);
 static bool pinAliasFree(uint8_t p, int skip_idx, uint8_t assigning);
@@ -2075,17 +2100,26 @@ static void handleCommand(const String& line) {
             break;
         }
         case 'Y': {
+            /* Validate the STRING, not the parsed value. toInt() maps every
+             * unparseable string to 0, and 0 here means "no fan output" - at
+             * which point setFan() writes nothing while the overheat override
+             * upstream still sets fanOn = true and reports success. That is a
+             * persistent silent cooling kill reachable with one stray
+             * character. Rejected input now has NO effect at all: no state
+             * change and no NVS write (saveCfg used to run on the reject path
+             * too, so a typo was persisted as well as silently applied). */
+            if (!argIsInt(val)) { Serial.println("Y <n> where n=0..7 (0 = no fan output)"); break; }
             int k = val.toInt();
-            if (k >= 0 && k <= 7) {
-                uint8_t old = g_cfg.fanOut;
-                g_cfg.fanOut = (uint8_t)k;
-                // Drive the OLD fan output low before re-pointing, or a relay
-                // latched ON under the previous fanOut stays stuck until the
-                // next failsafe/outputsOff pass.
-                if (old >= 1 && old <= 7) setOut(old - 1, false);
-                if (k > 0) setFan(false);
-            }
+            if (k < 0 || k > 7) { Serial.println("Y 0..7 (0 = no fan output)"); break; }
+            uint8_t old = g_cfg.fanOut;
+            g_cfg.fanOut = (uint8_t)k;
+            // Drive the OLD fan output low before re-pointing, or a relay
+            // latched ON under the previous fanOut stays stuck until the
+            // next failsafe/outputsOff pass.
+            if (old >= 1 && old <= 7) setOut(old - 1, false);
+            if (k > 0) setFan(false);
             saveCfg();
+            Serial.printf("fanOut=%d\n", k);
             break;
         }
         case 'R': {
