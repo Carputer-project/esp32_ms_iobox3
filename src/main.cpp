@@ -2089,8 +2089,22 @@ static void handleCommand(const String& line) {
             if (val == "0")      { s_buzzManual = true; pinMode(g_cfg.pin.buzz, INPUT_PULLUP); Serial.println("buzzpin=input_pullup"); }
             else if (val == "1") { s_buzzManual = true; pinMode(g_cfg.pin.buzz, INPUT);         Serial.println("buzzpin=float"); }
             else if (val == "2") { s_buzzManual = true; pinMode(g_cfg.pin.buzz, OUTPUT); digitalWrite(g_cfg.pin.buzz, HIGH); Serial.println("buzzpin=high_3v3"); }
-            else if (val == "3") { s_buzzManual = true; pinMode(g_cfg.pin.buzz, OUTPUT); digitalWrite(g_cfg.pin.buzz, LOW);  Serial.println("buzzpin=gnd_beep"); }
-            else if (val == "9") { s_buzzManual = false; Serial.println("buzzpin=auto"); }
+            else if (val == "3") { s_buzzManual = true; pinMode(g_cfg.pin.buzz, OUTPUT); digitalWrite(g_cfg.pin.buzz, LOW);  Serial.println("buzzpin=gnd_beep (X 9 to exit)"); }
+            else if (val == "9") {
+                s_buzzManual = false;
+                // X 9 used to clear the manual flag only. After `X 0` or `X 1` the
+                // pin was still INPUT, so updateBuzzer()'s digitalWrite() was a
+                // no-op and the buzzer stayed dead until a reboot — the command
+                // that is supposed to RESTORE the pin did not restore it. Re-run
+                // the same configuration applyPinConfig() establishes, and keep
+                // the "never touch the IAC pin" guard it has.
+                if (g_cfg.pin.buzz != g_cfg.pin.iac) {
+                    pinMode(g_cfg.pin.buzz, OUTPUT);
+                    gpio_pullup_en((gpio_num_t)g_cfg.pin.buzz);
+                    digitalWrite(g_cfg.pin.buzz, HIGH);   // inverted: HIGH = silent
+                }
+                Serial.println("buzzpin=auto (output restored)");
+            }
             else Serial.println("X0=pullup-hiz X1=float X2=3v3 X3=gnd(beep) X9=auto");
             break;
         default:
