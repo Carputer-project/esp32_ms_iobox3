@@ -110,7 +110,7 @@ struct PinMap {
 static constexpr uint16_t CFG_MAGIC = 0x4971;   // 0x4970→0x4971: wipe poisoned gas table (E=0 inversion), adopt 220R-front-end defaults
 // Stock gas anchors (reported mV) for the 220R-from-3V3 A4 front end:
 // FULL=3R/1009, EMPTY=110R/25014 (Toyota FSM sender spec). Used by `Q R` to
-// clear poisoned calibration and as a safe mapping fallback in gasPercent()
+// clear poisoned calibration and as a safe mapping fallback in gasPctFromFilt()
 // when the recorded anchors are degenerate/off-scale — so the needle can
 // never pin at 100% on garbage data (see 2026-09-20 gas-stuck-at-full fix).
 static constexpr uint16_t kGasStockMv[5] = {1009, 4800, 9800, 16418, 25014};
@@ -418,7 +418,8 @@ static uint8_t  s_anLatchByte = 0;
 static uint8_t  s_seq = 0;
 static uint16_t s_warnLatched = 0;   // forward decl (real def below)
 static volatile float s_speedMph = 0; // ABS speed, mph (0xB0 f[2])
-static int gasPercent();
+static void gasSampleMv();     // ADC read + EMA advance; ONCE per loop()
+static int  gasPctFromFilt();  // pure s_gasFilt -> percent mapping
 static void gasAutoCal();
 static void saveCfg();
 
@@ -537,7 +538,7 @@ static void espnowSendStatus() {
     f[2] = (uint8_t)constrain((int)s_speedMph, 0, 255);
     f[3] = ++s_seq;
     f[4] = (uint8_t)(s_warnLatched & 0xFF);
-    f[5] = (uint8_t)constrain(gasPercent(), 0, 100);
+    f[5] = (uint8_t)constrain(gasPctFromFilt(), 0, 100);
     for (uint8_t i = 0; i < 4; i++) {
         uint16_t mv = readAnalogMv(i);
         f[6 + i * 2]     = (uint8_t)(mv & 0xFF);
@@ -976,7 +977,7 @@ static void updateBuzzer() {
     } else if (now < s_buzzTestUntilMs) {
         on = true;                   // B T test beep
     } else if (g_cfg.buzzerEnable) {
-        bool lowFuel = gasPercent() <= g_cfg.lowFuelPct;
+        bool lowFuel = gasPctFromFilt() <= g_cfg.lowFuelPct;
         bool anyWarn = s_warnLatched != 0 || lowFuel;
         on = anyWarn && ((now % 1000) < 100);
     } else {
@@ -1084,7 +1085,18 @@ static void updateDisplay() {
 
 static int16_t s_gasFilt = -1;   // damped reported-mV, -1 = uninitialised
 
-static int gasPercent() {
+/* The ONLY function that reads the ADC and advances the EMA. Called exactly
+ * once per loop() iteration, from loop(), before any consumer runs.
+ *
+ * This used to be the first half of gasPercent(), which was called from six
+ * places (0xB0 frame, low-fuel buzzer test, gas log, gas display, and two
+ * Serial status prints) each of which also advanced the filter. So the damping
+ * a caller got depended on how many OTHER callers happened to run first in the
+ * same iteration — gasDamp was a per-call divisor, not a time constant, and the
+ * effective smoothing changed with which code path was active (display off,
+ * link down, a Serial command mid-print). Separating the sampling from the
+ * mapping makes the smoothing rate a property of loop() alone. */
+static void gasSampleMv() {
     uint16_t raw = readAnalogMv(3);   // A4 = fuel sender (GPIO35)
     int32_t f;
     if (g_cfg.gasDamp == 0 || s_gasFilt < 0) f = raw;
@@ -1094,7 +1106,11 @@ static int gasPercent() {
     // unplugs (open node rails toward 3V3 -> ~75k reported). 32k does both.
     // The old 16k cap silently froze every reading below ~half tank.
     s_gasFilt = (int16_t)constrain(f, 0, 32000);
+}
 
+/* Pure mapping: s_gasFilt -> percent. No ADC read, no side effect. Safe to
+ * call any number of times from any number of places. */
+static int gasPctFromFilt() {
     // Stuck-at-full poison guard (2026-09-20): a SET F pressed while the
     // sender was unplugged recorded the ~60k clamp into the FULL anchor, and
     // every real reading (11.3k-23.5k) is then <= c[0] -> needle pinned at
@@ -1173,16 +1189,20 @@ static void gasLogLoad() {
 }
 
 static void gasLogUpdate() {
-    // Both values must come from the SAME sample. gasPercent() is a write
-    // function: it advances the EMA and assigns s_gasFilt as a side effect. So
-    // reading `mv = s_gasFilt` BEFORE calling it yielded the previous sample's
-    // mV alongside this sample's percent. On a momentary sender dropout
+    // Both values must come from the SAME sample. Historically gasPercent() was
+    // a write function — it advanced the EMA and assigned s_gasFilt as a side
+    // effect — so reading `mv = s_gasFilt` BEFORE calling it yielded the previous
+    // sample's mV alongside this sample's percent. On a momentary sender dropout
     // (connector bounce, ignition blip) the node railed, pct became 0, and the
     // stale-but-valid mid-tank mv sailed through the plausibility gate below.
     // minPct was then latched to 0 permanently in NVS, which also unlocked
     // gasAutoCal()'s EMPTY-anchor rewrite (gated on minPct <= 5) against a
     // mid-tank mV. 'Q R' was the only way to clear it.
-    int pct = gasPercent();
+    //
+    // Now guaranteed rather than merely ordered: gasLogUpdate() reads the SAME
+    // s_gasFilt that gasPctFromFilt() maps, and gasSampleMv() ran once at the
+    // top of this loop() iteration, so the two can no longer disagree.
+    int pct = gasPctFromFilt();
     int mv  = s_gasFilt;
     // Plausibility gate: a dead/disconnected sender rails to the 32000 clamp
     // (open node ~75k) and reads 0%, a hard short reads ~0 and 100% — neither
@@ -1384,7 +1404,7 @@ static void updateGasDisplay() {
     if (!g_cfg.tftEnable || s_gasTft == nullptr) return;
     char buf[12];
 
-    int target = gasPercent();
+    int target = gasPctFromFilt();
     bool low = target <= g_cfg.lowFuelPct;
     bool phase = ((millis() / 500) & 1) == 0;
 
@@ -1517,9 +1537,9 @@ static void reportStatus() {
                   g_map / 10.0f, g_mat / 10.0f, g_clt / 10.0f,
                   g_tps / 10.0f, g_batt / 10.0f, g_afr / 10.0f,
                   g_cfg.buzzerEnable ? 1 : 0);
-    Serial.printf("gas=%d%% mv=%u est=%dmi damp=%u warn<=%u%% pts[F,3/4,1/2,1/4,E]=%u,%u,%u,%u,%u\n",
-                  gasPercent(), readAnalogMv(3),
-                  (int)((long)gasPercent() * g_cfg.tankGalX10 * g_cfg.gasMpg / 1000),
+    Serial.printf("gas=%d%% mv=%d est=%dmi damp=%u warn<=%u%% pts[F,3/4,1/2,1/4,E]=%u,%u,%u,%u,%u\n",
+                  gasPctFromFilt(), s_gasFilt,
+                  (int)((long)gasPctFromFilt() * g_cfg.tankGalX10 * g_cfg.gasMpg / 1000),
                   g_cfg.gasDamp, g_cfg.lowFuelPct,
                   g_cfg.gasCalMv[0], g_cfg.gasCalMv[1], g_cfg.gasCalMv[2],
                   g_cfg.gasCalMv[3], g_cfg.gasCalMv[4]);
@@ -1814,9 +1834,9 @@ static void handleCommand(const String& line) {
                 } else Serial.println("tank 1.0-50.0 gal");
                 break;
             }
-            Serial.printf("gas=%d%% mv=%u est=%dmi damp=%u warn<=%u%% mpg=%u tank=%.1fgal pts[F,3/4,1/2,1/4,E]=%u,%u,%u,%u,%u\n",
-                          gasPercent(), readAnalogMv(3),
-                          (int)((long)gasPercent() * g_cfg.tankGalX10 * g_cfg.gasMpg / 1000),
+            Serial.printf("gas=%d%% mv=%d est=%dmi damp=%u warn<=%u%% mpg=%u tank=%.1fgal pts[F,3/4,1/2,1/4,E]=%u,%u,%u,%u,%u\n",
+                          gasPctFromFilt(), s_gasFilt,
+                          (int)((long)gasPctFromFilt() * g_cfg.tankGalX10 * g_cfg.gasMpg / 1000),
                           g_cfg.gasDamp, g_cfg.lowFuelPct, g_cfg.gasMpg, g_cfg.tankGalX10 / 10.0f,
                           g_cfg.gasCalMv[0], g_cfg.gasCalMv[1], g_cfg.gasCalMv[2],
                           g_cfg.gasCalMv[3], g_cfg.gasCalMv[4]);
@@ -2187,6 +2207,11 @@ void setup() {
 void loop() {
     s_canFresh = s_anyGroupSeen && (millis() - s_lastFrameMs) < FAILSAFE_MS;
     decodeOutpc();
+    // Sample the fuel sender ONCE per iteration, before any consumer. Every
+    // reader below (0xB0 frame, gas log, gas display, low-fuel buzzer test,
+    // Serial status) maps this one sample, so they can never disagree and the
+    // EMA advances at a rate set by loop() alone. See gasSampleMv().
+    gasSampleMv();
     updateAnalogLatch();
     updateEngineProfile();
     updateOutputs();
