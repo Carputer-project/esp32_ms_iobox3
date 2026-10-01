@@ -1615,6 +1615,17 @@ static void tftGasAlloc() {
 
 /* One step per call. Deliberately NOT called from handleCommand(). */
 static void tftReinitStep() {
+    /* Re-check tftEnable on EVERY step, not just at teardown. The steps run one
+     * per loop() pass, so `P TFT 0` typed during the gas half used to leave the
+     * remaining steps initialising a display that had just been switched off —
+     * initTft()/initGasTft() both guard on tftEnable, so the state machine has
+     * to as well or it quietly diverges from them. */
+    if (s_tftStep != TFT_IDLE && s_tftStep != TFT_STEP_TEARDOWN && !g_cfg.tftEnable) {
+        teardownTft();
+        s_tftStep = TFT_IDLE;
+        Serial.println("tft re-init cancelled (tft disabled mid-sequence)");
+        return;
+    }
     switch (s_tftStep) {
         case TFT_IDLE: return;                       // nothing pending
         case TFT_STEP_TEARDOWN:
@@ -1626,6 +1637,7 @@ static void tftReinitStep() {
             s_tftStep = TFT_STEP_IDLE_BEGIN;
             return;
         case TFT_STEP_IDLE_BEGIN:                    // ~300 ms — the worst step
+            if (!s_tft) { s_tftStep = TFT_IDLE; Serial.println("tft re-init aborted: idle display alloc failed"); return; }
             s_tft->begin();
             s_tft->setRotation(1);
             s_tftStep = TFT_STEP_IDLE_FRAME;
@@ -1641,6 +1653,7 @@ static void tftReinitStep() {
             s_tftStep = TFT_STEP_GAS_BEGIN;
             return;
         case TFT_STEP_GAS_BEGIN:                     // ~300 ms
+            if (!s_gasTft) { s_tftStep = TFT_IDLE; Serial.println("tft re-init aborted: gas display alloc failed"); return; }
             s_gasTft->begin();
             s_gasTft->setRotation(1);
             s_tftStep = TFT_STEP_GAS_FRAME;
