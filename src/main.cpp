@@ -1991,7 +1991,17 @@ static void handleCommand(const String& line) {
             break;
         case 'T': {
             float t = val.toFloat();
-            if (t >= 500) g_cfg.iacTargetRpm = (int16_t)t;
+            // Upper bound as well as the 500 floor. `T` sits on the 0xC0
+            // allow-list, and a floor-only check let `T 40000` through: the
+            // (int16_t) cast of an out-of-range float is undefined in C++, so
+            // whatever the toolchain produced was stored and saved, and
+            // CFG_MAGIC is unchanged so it survived every reboot. The target
+            // feeds trim = constrain((target - rpm)/20, -5, 8) in
+            // updateOutputs(): a saturated 32767 pins the valve +8 above the CLT
+            // curve (over-open idle, harder hot restart), a wrapped negative
+            // pins it at -5 and starves it.
+            if (t >= 500 && t <= 3000) g_cfg.iacTargetRpm = (int16_t)t;
+            else Serial.println("T 500-3000 rpm");
             saveCfg();
             break;
         }
