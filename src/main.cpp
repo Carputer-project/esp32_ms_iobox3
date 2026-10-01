@@ -1360,17 +1360,53 @@ static void gasAutoCal() {
     int32_t fMv = (s_fullPctSinceCal  >= 95) ? s_fullMvSinceCal  : -1;
     int32_t eMv = (s_emptyPctSinceCal <= 5)  ? s_emptyMvSinceCal : -1;
 
-    if (fMv > 1000 && fMv < 30000 && fMv != g_cfg.gasCalMv[0] &&
-        (inverted ? fMv > g_cfg.gasCalMv[0] + 50 : fMv < g_cfg.gasCalMv[0] - 50)) {
-        g_cfg.gasCalMv[0] = (uint16_t)fMv;                         // FULL anchor
-        dirty = relin = true;
-        Serial.printf("gas auto-cal: F set = %u mv\n", g_cfg.gasCalMv[0]);
+    /* Hysteresis on the anchors, in the direction that makes them MORE extreme.
+     *
+     * The band exists so a jittery sample cannot ratchet an anchor, and it must
+     * stay directional - moving the FULL anchor less-full would leave the gauge
+     * reading high forever.
+     *
+     * It used to be an unconditional 50 mV step, and that made the FULL anchor
+     * mathematically un-committable out of the box. Stock kGasStockMv[0] is
+     * 1009; the validity floor is fMv > 1000. So the improving direction (lower
+     * mV) had 9 mV of valid headroom while the guard demanded a 50 mV step: the
+     * acceptable window was the EMPTY SET. On a stock install, or after any `Q R`
+     * reset, the FULL anchor could never be auto-calibrated - no matter how many
+     * full-tank observations accumulated - and it failed silently, because the
+     * branch simply never ran and printed nothing. EMPTY had the mirror problem
+     * once its anchor approached the 30000 ceiling.
+     *
+     * So: keep the band where it fits, and fall back to "valid and strictly
+     * better" where it does not. The >=95% / <=5% gate above has already thrown
+     * away samples that were not convincingly at the end of the scale, so a
+     * small step in the right direction is safe. */
+    constexpr int32_t GAS_CAL_BAND_MV  = 50;
+    constexpr int32_t GAS_CAL_VALID_LO = 1000;
+    constexpr int32_t GAS_CAL_VALID_HI = 30000;
+
+    int32_t fOld = g_cfg.gasCalMv[0];
+    if (fMv > GAS_CAL_VALID_LO && fMv < GAS_CAL_VALID_HI && fMv != fOld) {
+        int32_t band  = inverted ? fOld + GAS_CAL_BAND_MV : fOld - GAS_CAL_BAND_MV;
+        bool bandFits = inverted ? (band < GAS_CAL_VALID_HI) : (band > GAS_CAL_VALID_LO);
+        bool better   = inverted ? (fMv > fOld) : (fMv < fOld);
+        bool clears   = inverted ? (fMv >= band) : (fMv <= band);
+        if (better && (clears || !bandFits)) {
+            g_cfg.gasCalMv[0] = (uint16_t)fMv;                       // FULL anchor
+            dirty = relin = true;
+            Serial.printf("gas auto-cal: F set = %u mv\n", g_cfg.gasCalMv[0]);
+        }
     }
-    if (eMv > 1000 && eMv < 30000 && eMv != g_cfg.gasCalMv[4] &&
-        (inverted ? eMv < g_cfg.gasCalMv[4] - 50 : eMv > g_cfg.gasCalMv[4] + 50)) {
-        g_cfg.gasCalMv[4] = (uint16_t)eMv;                         // EMPTY anchor
-        dirty = relin = true;
-        Serial.printf("gas auto-cal: E set = %u mv\n", g_cfg.gasCalMv[4]);
+    int32_t eOld = g_cfg.gasCalMv[4];
+    if (eMv > GAS_CAL_VALID_LO && eMv < GAS_CAL_VALID_HI && eMv != eOld) {
+        int32_t band  = inverted ? eOld - GAS_CAL_BAND_MV : eOld + GAS_CAL_BAND_MV;
+        bool bandFits = inverted ? (band > GAS_CAL_VALID_LO) : (band < GAS_CAL_VALID_HI);
+        bool better   = inverted ? (eMv < eOld) : (eMv > eOld);
+        bool clears   = inverted ? (eMv <= band) : (eMv >= band);
+        if (better && (clears || !bandFits)) {
+            g_cfg.gasCalMv[4] = (uint16_t)eMv;                       // EMPTY anchor
+            dirty = relin = true;
+            Serial.printf("gas auto-cal: E set = %u mv\n", g_cfg.gasCalMv[4]);
+        }
     }
     if (relin && g_cfg.gasCalMv[0] < g_cfg.gasCalMv[4]) {
         for (uint8_t j = 1; j < 4; j++)
