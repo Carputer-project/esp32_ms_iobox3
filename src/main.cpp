@@ -1753,21 +1753,55 @@ static void reportStatus() {
  * loop(), so the flag cannot leak into a subsequent Serial command. */
 static bool s_cmdFromLink = false;
 
-static bool cmdIsSetFromUartOnly(char key, const String& val) {
-    // `P DASH <mac>` / `P DIAG <mac>` write a PEER FILTER to NVS that survives
-    // reboot and power-cycle, and peerAllowed() then rejects every frame from
-    // anyone else — including the real dash. The box goes silent on 0xA0,
-    // s_canFresh falls, and the failsafe stops cooling the engine. Recovery
-    // needs the UART console, because `P DASH CLEAR` is itself rejected over
-    // the air by an attacker who holds the bound MAC.
-    //
-    // That is a persistent remote cooling kill delivered by a single frame on an
-    // unencrypted, unauthenticated link. The dash has no reason to send it:
-    // can_tx.c only ever emits F, I, T, Q, B and L. So peer binding is now
-    // UART-only, which closes the attack without changing anything the dash
-    // does.
-    if (key != 'P') return false;
-    return val.startsWith("DASH") || val.startsWith("DIAG");
+/* Commands that change persistent configuration, rewire which GPIO drives
+ * which actuator, or take manual control of an output. All UART-console only.
+ *
+ * The original version of this list held only `P DASH` / `P DIAG`. That was
+ * wrong in a way the fix's own threat model should have caught: peerAllowed()
+ * accepts ANY peer when nothing is bound, which is the default, so a single
+ * broadcast 0xC0 frame reached every one of these. It refused the weakest
+ * command on the list and left the rest wide open — including `P WIPE`, which
+ * this same campaign added and which is strictly more destructive than the
+ * attack the list was written to close.
+ *
+ * Every entry below has the same shape: one frame reverts something the user
+ * dialled in, or moves a relay to a different pin, and the 0xD0 ack still says
+ * "ok". None of them is a command the dash ever sends — can_tx.c emits only
+ * F, I, T, Q, B and L, and nothing else in the workspace transmits 0xC0 — so
+ * refusing the whole group costs nothing.
+ *
+ * The real fix for all of this is encryption + frame authentication on the
+ * ESP-NOW link (still open, as D4/io-H2). Until then this is a deny-list
+ * because the set of genuinely-remote commands is small and known. */
+static bool cmdIsUartOnly(char key, const String& val) {
+    switch (key) {
+        // Entire family refused, not just peer binding:
+        //   P IAC/O<n>/BZ/TFTS/TFTM/TFTC/TFTD  remap which GPIO drives what,
+        //                                      incl. moving the fan relay
+        //   P TFT 0|1                            turn the displays on/off
+        //   P RESET                              wipe the pin map
+        //   P DASH/P DIAG                        persist a peer filter that can
+        //                                      lock the real dash out and stop
+        //                                      cooling the engine
+        //   P WIPE                               full factory reset
+        case 'P':
+            return true;
+        // X 0..3 takes manual control of the buzzer pin and holds it. X 3 is a
+        // continuous horn with no automatic exit, so a remote X 3 is a remote
+        // horn that only X 9 stops — and an attacker who drives it to X 3 first
+        // can then ignore X 9 arriving.
+        case 'X':
+            return true;
+        // Only the gas-table-writers. The dash legitimately sends Q D / Q W /
+        // Q M / Q T (damping, low-fuel %, mpg, tank size) and those still work.
+        //   Q R          wipes the calibration to stock
+        //   Q F/E/1/2/3  record the CURRENT A4 reading as a table anchor
+        case 'Q':
+            return val == "R" || val == "RESET" || val == "F" || val == "E" ||
+                   val == "1" || val == "2" || val == "3";
+        default:
+            return false;
+    }
 }
 
 static void handleCommand(const String& line) {
@@ -1780,9 +1814,9 @@ static void handleCommand(const String& line) {
     String val = c.substring(1);
     val.trim();
 
-    if (s_cmdFromLink && cmdIsSetFromUartOnly(key, val)) {
-        Serial.println("REFUSED: peer binding (P DASH/P DIAG) is UART-console only.");
-        Serial.println("         It persists a peer filter that can lock out the dash and stop cooling.");
+    if (s_cmdFromLink && cmdIsUartOnly(key, val)) {
+        Serial.printf("REFUSED '%s' — UART-console only. It rewires actuators or wipes stored settings.\n",
+                      c.c_str());
         return;
     }
 
@@ -2170,10 +2204,22 @@ static void handleCommand(const String& line) {
                 }
                 saveAnPol();
                 s_dashMacHinted = false;
+                // Buzzer overrides are RAM-only, so a wipe that left them behind
+                // would keep a piezo screaming with nothing left to stop it:
+                // `X 3` holds the pin hard LOW and updateBuzzer() early-returns
+                // on s_buzzManual, so applyPinConfig() alone does NOT release it.
+                s_buzzManual = false;
+                s_buzzLoop   = false;
                 applyPinConfig();
+                // Same trap on the backlight: g_cfg.ledOn is now false, but the
+                // WS2812 bar keeps emitting the pre-wipe colour until the next `L`
+                // command or a reboot, because ledApply() is only called from
+                // ledInit() and the `L` handler. "Reboot not required" was a lie.
+                ledApply();
                 tftReinitRequest();
                 Serial.println("FACTORY RESET: cfg + gas table + gas log + peer filters + A1-A4 polarity");
-                Serial.println("              all back to defaults. Reboot not required.");
+                Serial.println("              + LED bar + buzzer overrides, all back to defaults.");
+                Serial.println("              Reboot not required.");
                 break;
             }
             if (val == "TFT 1" || val == "TFT 0") {
