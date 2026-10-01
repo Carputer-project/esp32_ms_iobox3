@@ -1095,11 +1095,18 @@ static void updateDisplay() {
 }
 
 static int16_t s_gasFilt = -1;   // damped reported-mV, -1 = uninitialised
-// mV of the most recent sample that mapped to >=95% / <=5% UNDER THE CURRENT
-// table; -1 = not seen since the table last moved. These are the auto-cal gates
-// (see gasLogUpdate). Deliberately NOT the lifetime log extremes.
-static int16_t s_fullMvSinceCal  = -1;
-static int16_t s_emptyMvSinceCal = -1;
+// The HIGHEST/LOWEST percentage observed under the CURRENT table since it last
+// moved, and the mV that produced it. These are the auto-cal gates (see
+// gasLogUpdate); deliberately NOT the lifetime log extremes.
+// The pct is kept because "most extreme" is a property of the pct, not of the
+// sample order — recording the LAST sample that happened to cross 95% would let a
+// sender bouncing 95/99/97/96 commit 96 and re-linearise the whole tank curve off
+// a noise-contaminated endpoint. -1 / 101 are outside [0,100] so the first real
+// sample always wins.
+static int8_t   s_fullPctSinceCal  = -1;
+static int16_t  s_fullMvSinceCal   = -1;
+static int8_t   s_emptyPctSinceCal = 101;
+static int16_t  s_emptyMvSinceCal  = -1;
 
 /* The ONLY function that reads the ADC and advances the EMA. Called exactly
  * once per loop() iteration, from loop(), before any consumer runs.
@@ -1272,13 +1279,13 @@ static void gasLogUpdate() {
     if (pct > s_gasLog.maxPct) { s_gasLog.maxPct = (int8_t)pct; changed = true; }
     if (mv  < s_gasLog.minMv)  { s_gasLog.minMv  = (int16_t)mv; changed = true; }
     if (mv  > s_gasLog.maxMv)  { s_gasLog.maxMv  = (int16_t)mv; changed = true; }
-    // Track whether the CURRENT table has ever actually been observed at an
-    // extreme. These are the only inputs to the auto-commit gates — deliberately
-    // NOT lifetime minPct/maxPct, which gasLogRescore() recomputes from the
-    // current table and which therefore describe the CURRENT mapping of a
-    // historical voltage rather than a fresh observation.
-    if (pct >= 95) s_fullMvSinceCal  = (int16_t)mv;
-    if (pct <= 5)  s_emptyMvSinceCal = (int16_t)mv;
+    // Track the extremes observed under the CURRENT table. These are the only
+    // inputs to the auto-commit gates — deliberately NOT lifetime minPct/maxPct,
+    // which gasLogRescore() recomputes from the current table and which
+    // therefore describe the CURRENT mapping of a historical voltage rather than
+    // a fresh observation.
+    if (pct > s_fullPctSinceCal)  { s_fullPctSinceCal  = (int8_t)pct; s_fullMvSinceCal  = (int16_t)mv; }
+    if (pct < s_emptyPctSinceCal) { s_emptyPctSinceCal = (int8_t)pct; s_emptyMvSinceCal = (int16_t)mv; }
     if (changed) gasLogSave();
 
     gasAutoCal();
@@ -1306,8 +1313,12 @@ static void gasAutoCal() {
     if (s_gasLog.minPct < 0) return;              // log not seeded yet
     bool dirty = false, relin = false;
     bool inverted = g_cfg.gasCalMv[0] > g_cfg.gasCalMv[4];
-    int32_t fMv = s_fullMvSinceCal;               // mV of a >=95% observation
-    int32_t eMv = s_emptyMvSinceCal;              // mV of a <=5%  observation
+    // Gate on the EXTREME pct seen, and commit that pct's own mV. Testing only
+    // the mV would admit a reading that never reached 95%; testing the LAST
+    // crossing instead of the highest would commit whichever sample happened to
+    // come last and re-linearise the whole tank curve from a jittered endpoint.
+    int32_t fMv = (s_fullPctSinceCal  >= 95) ? s_fullMvSinceCal  : -1;
+    int32_t eMv = (s_emptyPctSinceCal <= 5)  ? s_emptyMvSinceCal : -1;
 
     if (fMv > 1000 && fMv < 30000 && fMv != g_cfg.gasCalMv[0] &&
         (inverted ? fMv > g_cfg.gasCalMv[0] + 50 : fMv < g_cfg.gasCalMv[0] - 50)) {
@@ -1337,8 +1348,8 @@ static void gasAutoCal() {
         s_gasFilt = -1;                          // reseed filter after cal change
         // The gates are "observations under the current table", and the table
         // just moved, so whatever was seen under the old one no longer counts.
-        s_fullMvSinceCal  = -1;
-        s_emptyMvSinceCal = -1;
+        s_fullPctSinceCal = -1;  s_fullMvSinceCal = -1;
+        s_emptyPctSinceCal = 101; s_emptyMvSinceCal = -1;
         // The percentages in the log are now displayed against a calibration
         // that no longer exists; re-derive them from the recorded mV so the band
         // matches the needle. (They are no longer used as gates.)
@@ -2115,8 +2126,8 @@ static void handleCommand(const String& line) {
                 memcpy(g_cfg.gasCalMv, kGasStockMv, sizeof(g_cfg.gasCalMv));
                 s_gasFilt = -1;
                 s_gasLog = GasLog{};
-                s_fullMvSinceCal  = -1;   // table moved; old observations don't count
-                s_emptyMvSinceCal = -1;
+                s_fullPctSinceCal = -1;  s_fullMvSinceCal  = -1;   // table moved
+                s_emptyPctSinceCal = 101; s_emptyMvSinceCal = -1;  // old obs don't count
                 gasLogSave();
                 saveCfg();
                 Serial.println("gas cal + log reset to stock (F=1009 E=25014) - now press SET FULL at a full tank, SET EMPTY at empty");
@@ -2156,8 +2167,8 @@ static void handleCommand(const String& line) {
                 // table", so they are void the moment the table moves. Without
                 // this, a `Q E 18000` could be immediately overwritten by
                 // auto-cal from the very reading the operator just rejected.
-                s_fullMvSinceCal  = -1;
-                s_emptyMvSinceCal = -1;
+                s_fullPctSinceCal = -1;  s_fullMvSinceCal  = -1;
+                s_emptyPctSinceCal = 101; s_emptyMvSinceCal = -1;
                 // The log's percentages now describe a calibration that no longer
                 // exists; re-derive them from the recorded mV so the band matches
                 // the needle. ('Q R' above needs no rescore — it wipes the log.)
@@ -2339,8 +2350,8 @@ static void handleCommand(const String& line) {
                 // on s_buzzManual, so applyPinConfig() alone does NOT release it.
                 s_buzzManual = false;
                 s_buzzLoop   = false;
-                s_fullMvSinceCal  = -1;
-                s_emptyMvSinceCal = -1;
+                s_fullPctSinceCal = -1;  s_fullMvSinceCal  = -1;
+                s_emptyPctSinceCal = 101; s_emptyMvSinceCal = -1;
                 s_gasFilt = -1;
                 applyPinConfig();
                 // Same trap on the backlight: g_cfg.ledOn is now false, but the
