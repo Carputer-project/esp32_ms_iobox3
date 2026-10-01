@@ -1635,6 +1635,28 @@ static void reportStatus() {
     }
 }
 
+/* True while a command came in over the unauthenticated ESP-NOW 0xC0 channel
+ * rather than the local UART console. Set only around the queue drain in
+ * loop(), so the flag cannot leak into a subsequent Serial command. */
+static bool s_cmdFromLink = false;
+
+static bool cmdIsSetFromUartOnly(char key, const String& val) {
+    // `P DASH <mac>` / `P DIAG <mac>` write a PEER FILTER to NVS that survives
+    // reboot and power-cycle, and peerAllowed() then rejects every frame from
+    // anyone else — including the real dash. The box goes silent on 0xA0,
+    // s_canFresh falls, and the failsafe stops cooling the engine. Recovery
+    // needs the UART console, because `P DASH CLEAR` is itself rejected over
+    // the air by an attacker who holds the bound MAC.
+    //
+    // That is a persistent remote cooling kill delivered by a single frame on an
+    // unencrypted, unauthenticated link. The dash has no reason to send it:
+    // can_tx.c only ever emits F, I, T, Q, B and L. So peer binding is now
+    // UART-only, which closes the attack without changing anything the dash
+    // does.
+    if (key != 'P') return false;
+    return val.startsWith("DASH") || val.startsWith("DIAG");
+}
+
 static void handleCommand(const String& line) {
     String c = line;
     c.trim();
@@ -1644,6 +1666,12 @@ static void handleCommand(const String& line) {
     char key = c[0];
     String val = c.substring(1);
     val.trim();
+
+    if (s_cmdFromLink && cmdIsSetFromUartOnly(key, val)) {
+        Serial.println("REFUSED: peer binding (P DASH/P DIAG) is UART-console only.");
+        Serial.println("         It persists a peer filter that can lock out the dash and stop cooling.");
+        return;
+    }
 
     switch (key) {
         case 'F':
@@ -2008,6 +2036,33 @@ static void handleCommand(const String& line) {
                 Serial.println("pin map reset to iobox3 defaults");
                 break;
             }
+            if (val == "WIPE") {
+                // Full factory reset — the ONLY command that clears everything.
+                // Previously there was no single recovery path: `P RESET` clears
+                // the pin map alone, `Q R` the gas calibration alone, and nothing
+                // cleared the peer filters. If a stray `P DASH <mac>` ever landed
+                // (now refused over the air, but a stored one can survive a
+                // firmware downgrade), the box rejected the real dash and only a
+                // hand-edited NVS could recover it.
+                g_prefs.clear();
+                g_cfg = Cfg{};
+                memcpy(g_cfg.gasCalMv, kGasStockMv, sizeof(g_cfg.gasCalMv));
+                saveCfg();
+                memset(s_dashMac, 0, sizeof(s_dashMac));
+                memset(s_diagMac, 0, sizeof(s_diagMac));
+                saveDashMac();
+                saveDiagMac();
+                s_gasLog = GasLog{};
+                gasLogSave();
+                for (uint8_t i = 0; i < 4; i++) { s_anForce[i] = -1; s_anLatch[i] = false; }
+                saveAnPol();
+                s_dashMacHinted = false;
+                applyPinConfig();
+                if (g_cfg.tftEnable) { teardownTft(); initTft(); initGasTft(); }
+                Serial.println("FACTORY RESET: cfg + gas table + gas log + peer filters + A1-A4 polarity");
+                Serial.println("              all back to defaults. Reboot not required.");
+                break;
+            }
             if (val == "TFT 1" || val == "TFT 0") {
                 g_cfg.tftEnable = (val == "TFT 1");
                 saveCfg();
@@ -2018,7 +2073,7 @@ static void handleCommand(const String& line) {
                 break;
             }
             int sp = val.indexOf(' ');
-            if (sp <= 0) { Serial.println("P IAC <pin> | P O<n> <pin> | P TFT 0|1 | P TFTS/TFTM/TFTC/TFTD/BZ <pin> | P DASH/DIAG <mac>|CLEAR | P RESET"); break; }
+            if (sp <= 0) { Serial.println("P IAC <pin> | P O<n> <pin> | P TFT 0|1 | P TFTS/TFTM/TFTC/TFTD/BZ <pin> | P DASH/DIAG <mac>|CLEAR | P RESET | P WIPE"); break; }
             String k = val.substring(0, sp);
             int pin = val.substring(sp + 1).toInt();
             k.trim();
@@ -2074,7 +2129,7 @@ static void handleCommand(const String& line) {
             } else if (k == "BZ") {
                 g_cfg.pin.buzz = (uint8_t)pin;
             } else {
-                Serial.println("P IAC <pin> | P O<n> <pin> | P TFT 0|1 | P TFTS/TFTM/TFTC/TFTD/BZ <pin> | P DASH/DIAG <mac>|CLEAR | P RESET");
+                Serial.println("P IAC <pin> | P O<n> <pin> | P TFT 0|1 | P TFTS/TFTM/TFTC/TFTD/BZ <pin> | P DASH/DIAG <mac>|CLEAR | P RESET | P WIPE");
                 break;
             }
             saveCfg();
@@ -2173,7 +2228,7 @@ static void handleCommand(const String& line) {
             else Serial.println("X0=pullup-hiz X1=float X2=3v3 X3=gnd(beep) X9=auto");
             break;
         default:
-            Serial.println("commands: ? | M | P[IAC <pin>|O<n> <pin>|TFTS/TFTM/TFTC/TFTD <pin>|BZ <pin>|TFT 0|1|RESET] | Q[F|E <mv>|M <mpg>|T <gal>] | F[onTempF|A|1|0] | E[offTempF] | I[duty|A|F] | T[targetRpm] | Y[fanOut 1-7|0] | S[shiftRpm] | O<n>[0|1|T<f>|R<rpm>] | A<n>[0|H<v>|L<v>|O<k> <v>|F <v>|<v>] | R | W[0|1|idle|maxrpm|clt|mat|batt|map|afr|hold|warnout|help] | B[0|1|T]");
+            Serial.println("commands: ? | M | P[IAC <pin>|O<n> <pin>|TFTS/TFTM/TFTC/TFTD <pin>|BZ <pin>|TFT 0|1|RESET|WIPE] | Q[F|E <mv>|M <mpg>|T <gal>] | F[onTempF|A|1|0] | E[offTempF] | I[duty|A|F] | T[targetRpm] | Y[fanOut 1-7|0] | S[shiftRpm] | O<n>[0|1|T<f>|R<rpm>] | A<n>[0|H<v>|L<v>|O<k> <v>|F <v>|<v>] | R | W[0|1|idle|maxrpm|clt|mat|batt|map|afr|hold|warnout|help] | B[0|1|T]");
             break;
     }
 }
@@ -2330,7 +2385,9 @@ void loop() {
     if (s_cmdQ) {
         char cmd[CMD_Q_LEN];
         while (xQueueReceive(s_cmdQ, cmd, 0) == pdTRUE) {
+            s_cmdFromLink = true;      // UART-only commands must be refused here
             handleCommand(String(cmd));
+            s_cmdFromLink = false;
             // Diag reply channel: ack every OTA command; full state after '?'.
             espnowSendAck(cmd);
             if (!strcmp(cmd, "?")) espnowSendSnapshot();
