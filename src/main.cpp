@@ -1553,6 +1553,106 @@ static void initTft() {
     }
 }
 
+/* ---------------------------------------------------------------------------
+ * Deferred, STEPPED TFT (re)initialisation.
+ *
+ * Measured cost of a full re-init: begin() is ~300 ms per display (both use
+ * RST=-1, so there is no hardware reset to lean on) and the first fillScreen()
+ * is ~180 ms (Adafruit_SPITFT has no fast path unless built TFT_HARD_SPI, so
+ * every pixel is 16 iterations x 3 digitalWrite()). Two displays ~= 1 s of solid
+ * blocking, in ONE uninterrupted stretch.
+ *
+ * That used to run inside handleCommand(), on the same loop() pass as
+ * updateOutputs(). Two consequences, both real:
+ *
+ *  1. The fan and IAC were frozen for that whole second. Pin changes are a
+ *     console operation, but the box is live while you type them.
+ *  2. Worse, s_canFresh is only evaluated at the TOP of loop(). During the
+ *     stall it is never recomputed, so the 500 ms failsafe could not trip at
+ *     all — the actuators sat at their last-written values with the link
+ *     already dead underneath them, and no amount of lost CAN would change it.
+ *
+ * So a re-init is now a small state machine advanced ONE step per loop(),
+ * from a point after updateOutputs() has run. The most expensive single step is
+ * begin() at ~300 ms, comfortably inside the 500 ms failsafe window, so cooling
+ * and the link check are re-evaluated between every step.
+ *
+ * setup() still calls initTft()/initGasTft() directly: nothing is at risk
+ * before the link is up, and a screen that is ready when the boot banner
+ * prints is worth more than a few ms. */
+enum TftStep : uint8_t {
+    TFT_IDLE = 0,
+    TFT_STEP_TEARDOWN,
+    TFT_STEP_IDLE_ALLOC,
+    TFT_STEP_IDLE_BEGIN,
+    TFT_STEP_IDLE_FRAME,
+    TFT_STEP_GAS_ALLOC,
+    TFT_STEP_GAS_BEGIN,
+    TFT_STEP_GAS_FRAME,
+};
+static TftStep s_tftStep = TFT_IDLE;
+
+/* Ask for a re-init. Returns immediately; the work happens in loop(). Coalesces:
+ * several pin changes in a row cost one re-init, not one each. */
+static void tftReinitRequest() {
+    if (s_tftStep == TFT_IDLE) s_tftStep = TFT_STEP_TEARDOWN;
+}
+
+static void tftIdleAlloc() {
+    if (s_tft == nullptr) {
+        // PINS SWAPPED: idle renderer drives the gas-CS/DC (CS2/DC21); the gas
+        // renderer takes the idle CS17/DC18.
+        s_tft = new Adafruit_GC9A01A(GAS_CS, GAS_DC,
+                                     g_cfg.pin.tftMosi, g_cfg.pin.tftSclk, -1);
+    }
+}
+static void tftGasAlloc() {
+    if (s_gasTft == nullptr) {
+        s_gasTft = new Adafruit_GC9A01A(g_cfg.pin.tftCs, g_cfg.pin.tftDc,
+                                        GAS_MOSI, GAS_SCLK, -1);
+    }
+}
+
+/* One step per call. Deliberately NOT called from handleCommand(). */
+static void tftReinitStep() {
+    switch (s_tftStep) {
+        case TFT_IDLE: return;                       // nothing pending
+        case TFT_STEP_TEARDOWN:
+            teardownTft();
+            s_tftStep = g_cfg.tftEnable ? TFT_STEP_IDLE_ALLOC : TFT_IDLE;
+            return;
+        case TFT_STEP_IDLE_ALLOC:                    // new(): ~0 ms, no SPI
+            tftIdleAlloc();
+            s_tftStep = TFT_STEP_IDLE_BEGIN;
+            return;
+        case TFT_STEP_IDLE_BEGIN:                    // ~300 ms — the worst step
+            s_tft->begin();
+            s_tft->setRotation(1);
+            s_tftStep = TFT_STEP_IDLE_FRAME;
+            return;
+        case TFT_STEP_IDLE_FRAME:                    // ~180 ms
+            drawGaugeFrame();
+            s_lastDuty[0] = s_lastRpm[0] = s_lastTgt[0] = s_lastClt[0] = 0;
+            s_lastMode[0] = s_lastStat[0] = s_lastWarn[0] = 0;
+            s_tftStep = TFT_STEP_GAS_ALLOC;
+            return;
+        case TFT_STEP_GAS_ALLOC:
+            tftGasAlloc();
+            s_tftStep = TFT_STEP_GAS_BEGIN;
+            return;
+        case TFT_STEP_GAS_BEGIN:                     // ~300 ms
+            s_gasTft->begin();
+            s_gasTft->setRotation(1);
+            s_tftStep = TFT_STEP_GAS_FRAME;
+            return;
+        case TFT_STEP_GAS_FRAME:                     // ~180 ms
+            drawGasFrame();
+            s_tftStep = TFT_IDLE;
+            Serial.println("tft re-init complete");
+            return;
+    }
+}
+
 static void saveCfg() {
     g_prefs.putBytes("cfg", &g_cfg, sizeof(g_cfg));
 }
@@ -2028,11 +2128,7 @@ static void handleCommand(const String& line) {
                 g_cfg.pin = PinMap{};
                 saveCfg();
                 applyPinConfig();
-                if (g_cfg.tftEnable) {
-                    teardownTft();
-                    initTft();
-                    initGasTft();
-                }
+                tftReinitRequest();
                 Serial.println("pin map reset to iobox3 defaults");
                 break;
             }
@@ -2058,7 +2154,7 @@ static void handleCommand(const String& line) {
                 saveAnPol();
                 s_dashMacHinted = false;
                 applyPinConfig();
-                if (g_cfg.tftEnable) { teardownTft(); initTft(); initGasTft(); }
+                tftReinitRequest();
                 Serial.println("FACTORY RESET: cfg + gas table + gas log + peer filters + A1-A4 polarity");
                 Serial.println("              all back to defaults. Reboot not required.");
                 break;
@@ -2066,10 +2162,8 @@ static void handleCommand(const String& line) {
             if (val == "TFT 1" || val == "TFT 0") {
                 g_cfg.tftEnable = (val == "TFT 1");
                 saveCfg();
-                teardownTft();
-                initTft();
-                initGasTft();
-                Serial.println(g_cfg.tftEnable ? "tft on" : "tft off");
+                tftReinitRequest();
+                Serial.println(g_cfg.tftEnable ? "tft on (re-init queued)" : "tft off (re-init queued)");
                 break;
             }
             int sp = val.indexOf(' ');
@@ -2134,12 +2228,8 @@ static void handleCommand(const String& line) {
             }
             saveCfg();
             applyPinConfig();
-            if (g_cfg.tftEnable) {
-                teardownTft();
-                initTft();
-                initGasTft();
-            }
-            Serial.println("pin map updated");
+            tftReinitRequest();
+            Serial.println("pin map updated (tft re-init queued)");
             break;
         }
         case 'W': {
@@ -2369,11 +2459,23 @@ void loop() {
     }
 
     static uint32_t tftLast = 0;
-    if (g_cfg.tftEnable && now - tftLast >= 100) {
+    // Skip the 10 Hz redraw while a re-init is in flight. Between alloc and
+    // begin() the object exists but the panel is unconfigured, and drawValue()
+    // would happily issue drawPixel()s into it — slow at best. updateDisplay()
+    // already guards on s_tft == nullptr, which covers the post-teardown window
+    // but NOT this one.
+    if (g_cfg.tftEnable && now - tftLast >= 100 && s_tftStep == TFT_IDLE) {
         tftLast = now;
         updateDisplay();
         updateGasDisplay();
     }
+
+    // Advance a queued TFT re-init by ONE step. Placed AFTER updateOutputs() so
+    // the actuators have already been written with this tick's data, and one
+    // step per pass so the worst single block (begin(), ~300 ms) stays well
+    // inside the 500 ms failsafe window. See tftReinitStep() for why this was
+    // worth splitting at all.
+    tftReinitStep();
 
     static uint32_t gasLogLast = 0;
     if (now - gasLogLast >= 100) {
@@ -2382,9 +2484,16 @@ void loop() {
     }
 
     // Drain queued 0xC0 commands (executed in loop context, not WiFi task).
+    //
+    // ONE command per pass, not a while-drain of the whole queue. A full drain
+    // of 6 slots runs every queued handler back-to-back with no actuator update
+    // and no s_canFresh re-evaluation in between, so the worst case was 6x any
+    // one command's blocking cost — which is how one pin-map change could stall
+    // the loop for seconds. One per pass bounds it to one command, and the
+    // queue still empties at the loop rate (~2 ms + work), so nothing backs up.
     if (s_cmdQ) {
         char cmd[CMD_Q_LEN];
-        while (xQueueReceive(s_cmdQ, cmd, 0) == pdTRUE) {
+        if (xQueueReceive(s_cmdQ, cmd, 0) == pdTRUE) {
             s_cmdFromLink = true;      // UART-only commands must be refused here
             handleCommand(String(cmd));
             s_cmdFromLink = false;
