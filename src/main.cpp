@@ -1004,7 +1004,12 @@ static void drawValue(int16_t x, int16_t y, uint8_t size, uint16_t color,
 
 static void updateDisplay() {
     if (!g_cfg.tftEnable || s_tft == nullptr) return;
-    char buf[12];
+    /* 24, not 12: the longest string formatted here is "FAN OFF  LINK OK" at
+     * 17 chars + NUL = 18. buf[12] truncated it to "FAN OFF  LI", and the
+     * centring below then used the truncated length, so the one line that
+     * reports both fan state and link state was both wrong and off-centre.
+     * s_lastStat is already 24; drawValue needs room for the widest %s/%d too. */
+    char buf[24];
 
     uint8_t duty = (uint8_t)(ledcRead(0) * 100 / 1023);
     snprintf(buf, sizeof buf, "%u%%", duty);
