@@ -168,7 +168,21 @@ static Preferences g_prefs;
 static const char* const kPrefsName = "iobox";
 
 static uint8_t  s_outpc[72];
-static bool     s_groupSeen[9] = { false, false, false, false, false, false, false, false, false };
+/* Group-seen flags as ONE uint32_t, not bool[9].
+ *
+ * These were nine separate bytes written outside the critical section that
+ * guards the payload, while updateOutputs() read them one at a time from the
+ * loop() task. The WiFi task publishing a frame mid-read could therefore leave
+ * a consumer holding payload from frame N with a mask that was half N and half
+ * N-1 — which is exactly the torn state the per-group gating exists to prevent
+ * (a stale g_clt read as present-in-this-frame). A 32-bit aligned load is a
+ * single atomic access, so one read of this word is self-consistent.
+ *
+ * It is written inside the same portENTER_CRITICAL as the payload memcpy, and
+ * decodeOutpc() snapshots it under the same mux, so mask and payload always
+ * come from the same frame. */
+static volatile uint32_t s_groupMask = 0;
+static inline bool groupSeen(uint8_t i) { return (s_groupMask >> i) & 1u; }
 static uint32_t s_lastFrameMs = 0;
 static uint32_t s_realRxMs = 0;    // any REAL frame received (proves link alive)
 static bool     s_canFresh = false;
@@ -184,7 +198,7 @@ static int16_t  g_map = 0, g_mat = 0, g_clt = 0, g_tps = 0, g_batt = 0, g_afr = 
 static int16_t  g_iacStep = 0;
 
 static void resetData() {
-    for (uint8_t i = 0; i < 9; i++) s_groupSeen[i] = false;
+    s_groupMask = 0;
     s_anyGroupSeen = false;
     s_lastFrameMs = 0;
     s_canFresh = false;
@@ -481,8 +495,8 @@ static void espnowRecv(const uint8_t* mac, const uint8_t* data, int len) {
             if (mask == 0) break;
             portENTER_CRITICAL(&s_outpcMux);
             memcpy(s_outpc, &data[3], 72);
+            s_groupMask = mask & 0x1FFu;   // 9 groups are live; ignore any stray high bits
             portEXIT_CRITICAL(&s_outpcMux);
-            for (uint8_t i = 0; i < 9; i++) s_groupSeen[i] = (mask & (1u << i)) != 0;
             s_anyGroupSeen = mask != 0;
             s_lastFrameMs = millis();
             s_realRxMs = millis();
@@ -690,24 +704,29 @@ static void espnowInit() {
 
 static void decodeOutpc() {
     // Snapshot under the mux so a frame arriving mid-decode can't tear a
-    // BE16 pair across two different broadcasts.
-    uint8_t local[72];
+    // BE16 pair across two different broadcasts. The group mask is snapshotted
+    // in the same critical section: taking it afterwards could pair this
+    // payload with the NEXT frame's mask, re-introducing the staleness the
+    // per-group gating is there to prevent.
+    uint8_t  local[72];
+    uint32_t mask;
     portENTER_CRITICAL(&s_outpcMux);
     memcpy(local, s_outpc, sizeof(local));
+    mask = s_groupMask;
     portEXIT_CRITICAL(&s_outpcMux);
 
-    if (s_groupSeen[0]) g_rpm  = rdU16(local, 6);
-    if (s_groupSeen[2]) {
+    if (mask & (1u << 0)) g_rpm  = rdU16(local, 6);
+    if (mask & (1u << 2)) {
         g_map  = rdS16(local, 18);
         g_mat  = rdS16(local, 20);
         g_clt  = rdS16(local, 22);
     }
-    if (s_groupSeen[3]) {
+    if (mask & (1u << 3)) {
         g_tps  = rdS16(local, 24);
         g_batt = rdS16(local, 26);
         g_afr  = rdS16(local, 28);
     }
-    if (s_groupSeen[6]) g_iacStep = rdS16(local, 54);
+    if (mask & (1u << 6)) g_iacStep = rdS16(local, 54);
 }
 
 // CAN-less simulation and boot self-test REMOVED (never inject synthetic ECU
@@ -732,18 +751,18 @@ static const char* topWarnName(uint16_t raw) {
 static uint16_t engineWarnFlags() {
     uint16_t raw = 0;
     if (!s_canFresh) return 0;
-    bool cltOk = s_groupSeen[2] && g_clt > 100 && g_clt < 3500;
-    bool matOk = s_groupSeen[2] && g_mat > 0 && g_mat < 3000;
-    bool onThrottle = s_groupSeen[3] && g_tps >= 50;
+    bool cltOk = groupSeen(2) && g_clt > 100 && g_clt < 3500;
+    bool matOk = groupSeen(2) && g_mat > 0 && g_mat < 3000;
+    bool onThrottle = groupSeen(3) && g_tps >= 50;
     bool afrOk = onThrottle && g_afr >= 100 && g_afr <= 250;
 
     // Partial-frame hardening: only trust a field if its group was present in
     // the current frame. On a real 0xA0 broadcast all 9 groups arrive together,
     // but if a frame is ever partial, g_* values from a previous frame would be
     // stale here and could misfire a warning / mis-drive an actuator.
-    bool rpmOk = s_groupSeen[0];
-    bool tpsOk = s_groupSeen[3];
-    bool battOk = s_groupSeen[3];
+    bool rpmOk = groupSeen(0);
+    bool tpsOk = groupSeen(3);
+    bool battOk = groupSeen(3);
 
     if (rpmOk && g_rpm >= g_cfg.eng.maxRpm) raw |= W_OVERREV;
     if (rpmOk && g_rpm > 0 && g_rpm < g_cfg.eng.idleRpmMin && tpsOk && g_tps < 200) raw |= W_IDLE_LO;
@@ -752,7 +771,7 @@ static uint16_t engineWarnFlags() {
     if (matOk && g_mat > g_cfg.eng.matMax) raw |= W_HOTAIR;
     if (battOk && g_batt > 0 && g_batt < g_cfg.eng.battMin) raw |= W_LOWBATT;
     if (battOk && g_batt > 0 && g_batt > g_cfg.eng.battMax) raw |= W_HIBATT;
-    if (s_groupSeen[2] && g_map > g_cfg.eng.mapMax) raw |= W_OVERBOOST;
+    if (groupSeen(2) && g_map > g_cfg.eng.mapMax) raw |= W_OVERBOOST;
     if (afrOk && g_afr > g_cfg.eng.afrHigh) raw |= W_LEAN;
     if (afrOk && g_afr < g_cfg.eng.afrLow) raw |= W_RICH;
     return raw;
@@ -804,8 +823,8 @@ static void updateOutputs() {
      * elapsed, keep the overheat override reachable, and only close the IAC when
      * the engine is stopped or genuinely cold. */
     bool linkFresh = s_canFresh;
-    bool engineRunning = s_groupSeen[0] && g_rpm > 300;
-    bool cltReadable  = s_groupSeen[2] && g_clt > 100 && g_clt < 3500;
+    bool engineRunning = groupSeen(0) && g_rpm > 300;
+    bool cltReadable  = groupSeen(2) && g_clt > 100 && g_clt < 3500;
     bool cltHot       = cltReadable && g_clt >= g_cfg.fanOnTemp;
     bool fanHoldOn    = false;   /* minimum-on hold while the link is down */
 
@@ -813,7 +832,7 @@ static void updateOutputs() {
         if (!s_fanHeldAfterLinkLoss) { s_fanHeldAfterLinkLoss = true; s_fanOffAtMs = millis(); }
         bool withinRunOn = (millis() - s_fanOffAtMs) < FAN_RUNON_MS;
 
-        /* Note on cltReadable: it requires s_groupSeen[2], so a frame that
+        /* Note on cltReadable: it requires groupSeen(2), so a frame that
          * omitted group 2 makes cltHot false. That is correct for the warning
          * path (do not act on absent data) but must NOT disable cooling: if the
          * last known coolant was hot, keep cooling until we can prove it is not.
@@ -843,7 +862,7 @@ static void updateOutputs() {
     }
 
     int16_t clt = g_clt;
-    bool cltOk = s_groupSeen[2] && clt > 100 && clt < 3500;
+    bool cltOk = groupSeen(2) && clt > 100 && clt < 3500;
 
     bool fanOn = false;
     // Hoisted to updateOutputs() scope (not the auto+cltOk block) so the
@@ -887,7 +906,7 @@ static void updateOutputs() {
     fanOn = fanOn || inputForces(7);
     // Link-lost minimum-on hold: keep the fan driven after the ESP-NOW link
     // drops so a flapping link cannot strobe it, and so a warm engine stays
-    // cooled through the dropout. Uses the raw g_clt (not the s_groupSeen[2]-
+    // cooled through the dropout. Uses the raw g_clt (not the groupSeen(2)-
     // gated cltOk) because the whole point is to keep cooling when the last
     // frame did not carry coolant data.
     if (fanHoldOn) fanOn = true;
@@ -900,7 +919,7 @@ static void updateOutputs() {
             case OM_OFF:  on = false; break;
             case OM_MAN:  on = g_cfg.outManual[i]; break;
             case OM_TEMP: on = cltOk && clt >= g_cfg.outTemp[i]; break;
-            case OM_RPM:  on = s_groupSeen[0] && g_rpm >= g_cfg.outRpm[i]; break;
+            case OM_RPM:  on = groupSeen(0) && g_rpm >= g_cfg.outRpm[i]; break;
         }
         on = on || inputForces(i + 1);
         setOut(i, on);
@@ -913,9 +932,9 @@ static void updateOutputs() {
     }
 
     uint8_t duty;
-    if (g_cfg.iacFollow && s_groupSeen[6]) {
+    if (g_cfg.iacFollow && groupSeen(6)) {
         duty = (uint8_t)constrain((int16_t)(g_iacStep * 100 / 255), 0, 100);
-    } else if (g_cfg.iacAuto || (g_cfg.iacFollow && !s_groupSeen[6])) {
+    } else if (g_cfg.iacAuto || (g_cfg.iacFollow && !groupSeen(6))) {
         if (!cltOk) {
             duty = interpolateIac(120);
         } else {
@@ -923,7 +942,7 @@ static void updateOutputs() {
             // Trim idle towards the target rpm, but only if the current frame
             // actually carried RPM — otherwise g_rpm is stale and the trim is
             // garbage. Partial-frame hardening (see engineWarnFlags).
-            if (s_groupSeen[0]) {
+            if (groupSeen(0)) {
                 int16_t err = g_cfg.iacTargetRpm - (int16_t)g_rpm;
                 int16_t trim = constrain((int16_t)(err / 20), -5, 8);
                 duty = constrain((int16_t)duty + trim, 5, kIacDutyMax);
@@ -1021,7 +1040,7 @@ static void updateDisplay() {
     snprintf(buf, sizeof buf, "%d", (int)g_cfg.iacTargetRpm);
     drawValue(108, 146, 2, GC9A01A_YELLOW, 100, s_lastTgt, buf);
 
-    bool cltOk = s_groupSeen[2] && g_clt > 100 && g_clt < 3500;
+    bool cltOk = groupSeen(2) && g_clt > 100 && g_clt < 3500;
     snprintf(buf, sizeof buf, cltOk ? "%dF" : "--", g_clt / 10);
     drawValue(40, 184, 2, cltOk ? GC9A01A_YELLOW : GC9A01A_DARKGREY, 64, s_lastClt, buf);
 
