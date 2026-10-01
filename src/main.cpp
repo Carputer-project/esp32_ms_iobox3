@@ -343,9 +343,14 @@ static void outputsOff() {
     for (uint8_t i = 0; i < 7; i++) setOut(i, false);
 }
 
+/* Which PinMap field a caller is about to overwrite, so pinAliasFree() can tell
+ * "this pin is already mine" from "this pin is already someone else's".
+ * Deliberately a separate parameter from skip_idx - see pinAliasFree(). */
+enum : uint8_t { PINASSIGN_NONE = 0, PINASSIGN_IAC, PINASSIGN_BZ };
+
 static void handleCommand(const String& line);
 static bool pinOk(uint8_t p);
-static bool pinAliasFree(uint8_t p, int skip_idx);
+static bool pinAliasFree(uint8_t p, int skip_idx, uint8_t assigning);
 // ---------------------------------------------------------------------------
 // Clock backlight LED bar (WS2812-type addressable, 6 LEDs) on GPIO4.
 // RMT one-shot TX; sends only on change so ESP-NOW timing is untouched.
@@ -2448,12 +2453,12 @@ static void handleCommand(const String& line) {
             if (k == "IAC")        skipIdx = -2;   /* iac: nothing to skip, always check all */
             else if (k.length() == 2 && k[0] == 'O') skipIdx = (int)(uint8_t)(k[1] - '1');
             if (skipIdx == -2) {
-                if (!pinAliasFree((uint8_t)pin, -1)) {
+                if (!pinAliasFree((uint8_t)pin, -1, PINASSIGN_IAC)) {
                     Serial.println("pin rejected: already used by another output/IAC/buzzer/LED/speed/gas pin");
                     break;
                 }
             } else if (skipIdx >= 0 && skipIdx <= 6) {
-                if (!pinAliasFree((uint8_t)pin, skipIdx)) {
+                if (!pinAliasFree((uint8_t)pin, skipIdx, PINASSIGN_NONE)) {
                     Serial.printf("pin rejected: GPIO%u already in use by another mapped pin\n", pin);
                     break;
                 }
@@ -2463,7 +2468,8 @@ static void handleCommand(const String& line) {
             } else {
                 /* The TFT SCLK/MOSI/CS/DC and BZ pins must also not collide
                  * with the actuator pins. */
-                if (!pinAliasFree((uint8_t)pin, -1)) {
+                if (!pinAliasFree((uint8_t)pin, -1,
+                                  k == "BZ" ? PINASSIGN_BZ : PINASSIGN_NONE)) {
                     Serial.println("pin rejected: already used by an output/IAC/buzzer/LED/speed/gas pin");
                     break;
                 }
@@ -2626,9 +2632,32 @@ static bool pinOk(uint8_t p) {
  * This validates the PROPOSED pin against everything it must not collide with.
  * Returns false if p is already used by iac/buzz/ledData/speed/gas, or by any
  * other out[] entry other than out[skip_idx]. */
-static bool pinAliasFree(uint8_t p, int skip_idx) {
-    if (p == g_cfg.pin.iac  && skip_idx != -1) return false;
-    if (p == g_cfg.pin.buzz && skip_idx != -1) return false;
+/* Which PinMap field the caller is about to overwrite, so pinAliasFree() can
+ * tell "this pin is already mine" from "this pin is already someone else's".
+ * Deliberately a separate parameter from skip_idx - see pinAliasFree(). */
+static bool pinAliasFree(uint8_t p, int skip_idx, uint8_t assigning) {
+    /* The iac/buzz checks used to be `p == g_cfg.pin.iac && skip_idx != -1`.
+     * That conflated two different ideas behind one sentinel: -1 meant both
+     * "no out[] entry is being reassigned" AND "the caller is the IAC itself".
+     * Both the P IAC path and the TFT/BZ path pass -1, so those two - the two
+     * that must check iac and buzz - skipped the check entirely. One command
+     * from factory defaults was enough:
+     *
+     *   P TFTS 19
+     *
+     * pinOk(19) passes. 19 is not ledData, not PIN_SPEED, not a GAS_* pin, and
+     * not in out[] {13,12,14,27,26,25,33} - so the call returned TRUE and
+     * tftSclk became GPIO19, the IAC MOSFET gate. saveCfg() persisted it, and
+     * applyPinConfig() then ran ledcAttachPin(19,0) while the GC9A01A clocked
+     * that same pin, so the valve was chopped by SPI edges at 10 Hz for as long
+     * as a display was attached. P TFTM/TFTC/TFTD 19 were identical, and
+     * P IAC 32 (the default buzzer pin) made pin.iac == pin.buzz == 32.
+     *
+     * skip_idx is now only ever about out[]; `assigning` carries the iac/buzz
+     * exemption. A caller may reuse the pin it already owns, but is still
+     * rejected if it collides with the other one. */
+    if (p == g_cfg.pin.iac  && assigning != PINASSIGN_IAC) return false;
+    if (p == g_cfg.pin.buzz && assigning != PINASSIGN_BZ)  return false;
     if (p == g_cfg.pin.ledData) return false;
     if (p == PIN_SPEED || p == GAS_SCLK || p == GAS_MOSI || p == GAS_CS || p == GAS_DC) return false;
     for (int i = 0; i < 7; i++) {
