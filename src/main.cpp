@@ -190,7 +190,8 @@ static uint8_t  s_outpc[72];
  * decodeOutpc() snapshots it under the same mux, so mask and payload always
  * come from the same frame. */
 static volatile uint32_t s_groupMask = 0;
-static inline bool groupSeen(uint8_t i) { return (s_groupMask >> i) & 1u; }
+static uint32_t           s_groupMaskSnap = 0;  // snapshot of the mask that matches the last decoded payload
+static inline bool groupSeen(uint8_t i) { return (s_groupMaskSnap >> i) & 1u; }
 static uint32_t s_lastFrameMs = 0;
 static uint32_t s_realRxMs = 0;    // any REAL frame received (proves link alive)
 static bool     s_canFresh = false;
@@ -207,6 +208,7 @@ static int16_t  g_iacStep = 0;
 
 static void resetData() {
     s_groupMask = 0;
+    s_groupMaskSnap = 0;
     s_anyGroupSeen = false;
     s_lastFrameMs = 0;
     s_canFresh = false;
@@ -722,6 +724,7 @@ static void decodeOutpc() {
     portENTER_CRITICAL(&s_outpcMux);
     memcpy(local, s_outpc, sizeof(local));
     mask = s_groupMask;
+    s_groupMaskSnap = mask;  // consistent with the local[72] copy just snapped under the same mux
     portEXIT_CRITICAL(&s_outpcMux);
 
     if (mask & (1u << 0)) g_rpm  = rdU16(local, 6);
