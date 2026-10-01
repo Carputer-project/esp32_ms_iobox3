@@ -1558,10 +1558,30 @@ static void saveCfg() {
 }
 
 static void loadCfg() {
-    size_t len = g_prefs.getBytes("cfg", &g_cfg, sizeof(g_cfg));
+    // Distinguish the three ways this can fail. They used to collapse into one
+    // silent `g_cfg = Cfg{}`, which made a corrupt or truncated NVS blob
+    // indistinguishable from a brand-new box: same defaults, same silence, and
+    // a calibrated gas table, a pin map and the engine profile simply gone with
+    // nothing on the console to say so.
+    bool present = g_prefs.isKey("cfg");
+    size_t len   = g_prefs.getBytes("cfg", &g_cfg, sizeof(g_cfg));
+
     if (len != sizeof(g_cfg) || g_cfg.magic != CFG_MAGIC) {
+        bool magicBad = (len == sizeof(g_cfg) && g_cfg.magic != CFG_MAGIC);
         g_cfg = Cfg{};
         saveCfg();
+        if (!present) {
+            Serial.printf("cfg: no stored config — first boot, defaults written (magic %04x)\n", CFG_MAGIC);
+        } else if (magicBad) {
+            Serial.printf("cfg: STALE CONFIG — stored magic is not %04x, defaults written.\n"
+                          "      This is normal after a deliberate magic bump. If you did not expect it,\n"
+                          "      the pin map / gas table / engine profile were reset.\n", CFG_MAGIC);
+        } else {
+            Serial.printf("cfg: CORRUPT — read %u of %u bytes, defaults written and STORED OVER the bad blob.\n"
+                          "      The stored config has been overwritten; pin map, gas table and engine\n"
+                          "      profile are back to defaults. This is NOT a normal first boot.\n",
+                          (unsigned)len, (unsigned)sizeof(g_cfg));
+        }
     }
     // Fan temps are now FIXED (command removed) — always authoritative.
     g_cfg.fanOnTemp = 1800;
@@ -2234,7 +2254,14 @@ void setup() {
     Serial.begin(115200);
     delay(200);
 
-    g_prefs.begin(kPrefsName, false);
+    // Do not ignore this. A failed NVS mount made every later put/get a no-op,
+    // so the box would run on defaults and quietly DISCARD every setting the
+    // user made for the rest of the session, with nothing on the console.
+    if (!g_prefs.begin(kPrefsName, false)) {
+        Serial.println("FATAL: NVS 'iobox' failed to open — settings cannot be saved or loaded.");
+        Serial.println("      Running on defaults. All changes this session will be LOST.");
+        Serial.println("      Check free flash and that the NVS partition exists.");
+    }
     loadCfg();
     gasLogLoad();
     loadDashMac();
