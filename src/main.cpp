@@ -1408,19 +1408,13 @@ static bool gasAnchorSane(int32_t mv) {
  * A stored flag would be cleaner state and is not an option: loadCfg() rejects
  * any blob whose length != sizeof(g_cfg), so one added bit in struct Cfg wipes
  * the pin map, the engine profile and the calibration on every box in the field.
- * Inferring it also keeps `Q R` a pure data restore - it has no flag to clear,
- * and the factory curve it just wrote is immediately reported as "in effect".
+ * Inferring it also keeps `Q R` a pure data restore - it has no flag to clear.
  *
- * Called on every display pass (updateGasDisplay) to tell the operator which
- * shape the gauge is using, so read-only and cheap. */
-static bool gasMidsAreExplicit() {
-    const uint16_t *c = g_cfg.gasCalMv;
-    int32_t lo = min((int32_t)c[0], (int32_t)c[4]);
-    int32_t hi = max((int32_t)c[0], (int32_t)c[4]);
-    for (uint8_t j = 1; j < 4; j++)
-        if ((int32_t)c[j] != lo + (int32_t)((uint32_t)(hi - lo) * j) / 4) return true;
-    return false;
-}
+ * (This inference was added alongside a CAL / CAL* badge that displayed it. The
+ * badge was removed at the owner's request - they know when the tank is empty and
+ * full, which is the fact the calibration depends on, and did not need telling
+ * which shape the mid anchors had. The behaviour it reported is preserved either
+ * way; the badge was only ever a report of it.) */
 
 static int gasPctFromMv(int16_t mv) {
     uint16_t c[5];
@@ -1575,8 +1569,8 @@ static void gasLogUpdate() {
 
 /* Fill the three mid anchors between the CURRENT FULL/EMPTY pair.
  *
- * keepExplicit: the stored mids are a `Q 1/2/3` refinement or the factory curve
- * (see gasMidsAreExplicit) and only the slots that still fit monotonically
+ * keepExplicit: the stored mids are a `Q 1/2/3` refinement or the factory curve,
+ * and only the slots that still fit monotonically
  * between the new endpoints are kept. false when the endpoint that moved was
  * itself off-scale, i.e. the mids were interpolated from a table that is not a
  * tank calibration and there is nothing to salvage.
@@ -1884,11 +1878,6 @@ static char s_lastGasLo[8] = "";
 static char s_lastGasHi[8] = "";
 static char s_lastGasLoMv[8] = "";
 static char s_lastGasHiMv[8] = "";
-// Delta tracker for the "CAL"/"CAL*" mid-curve indicator (see
-// gasMidsAreExplicit). File scope with the rest of them so drawGasFrame() can
-// invalidate it, and forced in updateGasDisplay()'s needle-erase path because
-// the black triangle reaches r=118 and clips anything under it.
-static char s_lastGasCal[8] = "";
 static bool  s_needleDrawn = false;
 static float s_needleDeg = 0.0f;
 static int   s_gasDisp = -1;
@@ -2015,7 +2004,6 @@ static void drawGasFrame() {
     s_blinkPhase = false;
     s_lastGasMv[0] = s_lastGasPct[0] = s_lastGasLow[0] = s_lastGasLo[0] = s_lastGasHi[0] = 0;
     s_lastGasLoMv[0] = s_lastGasHiMv[0] = 0;
-    s_lastGasCal[0] = 0;
     s_lastPctColor = s_lastLowColor = 0xFFFF;
     // The float-history band is delta-tracked, and the delta tracker must
     // describe the PANEL, not the intention - so it is set to the band
@@ -2076,12 +2064,6 @@ static void updateGasDisplay() {
                     s_needleDeg + GAS_NEEDLE_WEDGE_DEG,
                     s_gasLog.minPct, s_gasLog.maxPct);
         drawGasMarks();
-        // The black triangle runs out to r=118, so it clips the CAL indicator
-        // too. Its delta tracker would otherwise still read "up to date" and the
-        // text would stay cut in half until the calibration changed for some
-        // other reason. Forcing the tracker here costs one 4-character redraw on
-        // a pass that already repaints three labels above.
-        s_lastGasCal[0] = 0;
     }
 
     /* Min/Max tank-float log: a yellow band on the tick ring tracing the sweep
@@ -2143,20 +2125,23 @@ static void updateGasDisplay() {
     uint16_t pctColor = low ? (phase ? GC9A01A_RED : GC9A01A_DARKGREY) : GC9A01A_CYAN;
     drawGasText(88, 208, 2, 68, pctColor, s_lastGasPct, &s_lastPctColor, buf);
 
-    /* WHICH MID CURVE IS IN EFFECT, on the panel.
+    /* WHICH MID CURVE IS IN EFFECT used to be shown here as a CAL / CAL* badge.
      *
-     * The operator's decision about the mid anchors used to leave no trace
-     * anywhere but Serial, and the dash is sent nothing but the percentage in
-     * f[5] - so "my Q 2 was quietly thrown away on the next drive" was
-     * indistinguishable, from the driver's seat, from the calibration simply
-     * being right. This is the whole visible difference: '*' means the
-     * operator's or the factory's curve is in force, no '*' means auto-cal left
-     * a straight taper. Constant DARKGREY, matching the 1/4 / 1/2 / 3/4 labels,
-     * so it reads as gauge furniture and never competes with the cyan or red
-     * data. Delta-tracked, so it is one strcmp per pass and no drawing at all
-     * unless the state changed or the needle clipped it. */
-    drawGasText(40, 196, 1, 34, GC9A01A_DARKGREY, s_lastGasCal, nullptr,
-                gasMidsAreExplicit() ? "CAL*" : "CAL");
+     * Removed at the owner's request: it told the operator which shape the
+     * mid anchors have, and the operator does not need telling - they know when
+     * the tank is empty and when it is full, which is the information the
+     * calibration actually depends on. A permanent element on a gauge you
+     * already know is a cost, not a free diagnostic.
+     *
+     * The BEHAVIOUR is unchanged and is the part that mattered: a `Q 1/2/3`
+     * refinement is now preserved across a full-to-empty drive instead of being
+     * overwritten by a derived taper (M12). That no longer needs telling the
+     * driver, because it no longer happens.
+     *
+     * The traceability that the badge was invented for still exists on the
+     * console: `Q` prints the live anchor table, and gasAutoCal() prints which
+     * anchor it moved. Serial is the right place for a one-time calibration
+     * fact; the gauge is for driving. */
 
 }
 
