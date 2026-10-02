@@ -2070,20 +2070,57 @@ static void handleCommand(const String& line) {
             saveCfg();
             break;
         case 'I':
+            /* Validate the STRING, not the parsed value. String::toInt()
+             * returns 0 for anything unparseable and 0 is a LEGAL idle-air
+             * duty, so `val.length() > 0` was not a check: `I abc`, `I -5` or
+             * any single stray character all reached the manual branch and set
+             * iacFollow=false / iacAuto=false / duty=0. updateOutputs() then
+             * falls to its final `else` and calls setIac(0), which is the
+             * CLOSED stop - the idle-air valve shuts. A bare `I` with no
+             * argument did the same, silently, having changed no intent at all.
+             * argIsInt() separates "the operator typed 0" from "the operator
+             * typed rubbish"; the range check then rejects out-of-band values
+             * instead of silently clamping them. A refused argument changes
+             * nothing and prints why. */
             if (val == "F") {
                 g_cfg.iacAuto = false;
                 g_cfg.iacFollow = true;
             } else if (val == "A") {
                 g_cfg.iacFollow = false;
                 g_cfg.iacAuto = true;
-            } else if (val.length() > 0) {
+            } else if (argIsInt(val)) {
+                int k = val.toInt();
+                if (k < 0 || k > 100) { Serial.println("I duty 0-100"); break; }
                 g_cfg.iacFollow = false;
                 g_cfg.iacAuto = false;
-                g_cfg.iacManualDuty = (uint8_t)constrain((int)val.toInt(), 0, 100);
+                g_cfg.iacManualDuty = (uint8_t)k;
+            } else {
+                Serial.println("I F|A|<duty 0-100>");
             }
             saveCfg();
             break;
         case 'T': {
+            /* Validate the STRING first, for the same reason as `I`. toFloat()
+             * also maps unparseable input to 0, and worse it stops at the first
+             * bad character: `T 1000abc` parsed as 1000.0 and was stored as a
+             * real target. `T` is on the 0xC0 allow-list, so this is reachable
+             * from the air. Optional leading '-', at most one '.', and at least
+             * one digit - which rejects "abc", "", "-", "5.5.5", "1000abc" and
+             * "nan". Kept local to this arm rather than added beside argIsInt()
+             * because that helper is shared with `Y` and is integer-only. */
+            auto tArgIsNum = [](const String& s) {
+                if (s.length() == 0) return false;
+                bool dot = false, digit = false;
+                for (unsigned i = 0; i < s.length(); i++) {
+                    char c = s[i];
+                    if (c == '-' && i == 0 && s.length() > 1) continue;
+                    if (c == '.') { if (dot) return false; dot = true; continue; }
+                    if (c < '0' || c > '9') return false;
+                    digit = true;
+                }
+                return digit;
+            };
+            if (!tArgIsNum(val)) { Serial.println("T 500-3000 rpm"); break; }
             float t = val.toFloat();
             // Upper bound as well as the 500 floor. `T` sits on the 0xC0
             // allow-list, and a floor-only check let `T 40000` through: the
@@ -2095,7 +2132,7 @@ static void handleCommand(const String& line) {
             // curve (over-open idle, harder hot restart), a wrapped negative
             // pins it at -5 and starves it.
             if (t >= 500 && t <= 3000) g_cfg.iacTargetRpm = (int16_t)t;
-            else Serial.println("T 500-3000 rpm");
+            else { Serial.println("T 500-3000 rpm"); break; }
             saveCfg();
             break;
         }
