@@ -1042,11 +1042,43 @@ static uint32_t s_buzzTestUntilMs = 0;
 static bool s_buzzLoop = false;    // B L: backup-truck beep until B 0 / B 1 / B L
 
 static bool s_buzzManual = false;  // X <n>: manual pin test, auto drive paused
+/* A manual pin test must not be able to hold the horn on forever. `X 3` drives
+ * the pin LOW (continuous sound) and s_buzzManual used to clear only on `X 9` or
+ * a `P WIPE` - so an operator who walked away after testing left an unstoppable
+ * horn, and silencing it meant erasing the whole configuration.
+ *
+ * 5 s: long enough to hear and diagnose a pin test, short enough that an
+ * unattended box goes quiet on its own. Same magnitude as FAN_RUNON_MS. */
+static constexpr uint32_t BUZZ_MANUAL_MS = 5000;
+static uint32_t s_buzzManualUntilMs = 0;
+
+/* Give the buzzer pad back to the firmware. SHARED by `X 9` and the manual-test
+ * timeout, deliberately: this file already shipped the bug where a path cleared
+ * s_buzzManual but left the pad configured, so the pin was still not driven by
+ * updateBuzzer() and the buzzer stayed dead until a reboot. Clearing the flag
+ * without restoring the pin is the same bug a second time, so there is exactly
+ * one implementation of "release" and both callers use it.
+ *
+ * The `!= iac` guard is not optional: on a config where pin.buzz == pin.iac
+ * this pad is the idle-air MOSFET gate and must be left to its LEDC PWM. */
+static void buzzReleasePin() {
+    if (g_cfg.pin.buzz == g_cfg.pin.iac) return;
+    pinMode(g_cfg.pin.buzz, OUTPUT);
+    gpio_pullup_en((gpio_num_t)g_cfg.pin.buzz);
+    digitalWrite(g_cfg.pin.buzz, HIGH);   // inverted: HIGH = silent
+}
 
 static void updateBuzzer() {
     static uint32_t last = 0;
     uint32_t now = millis();
-    if (s_buzzManual) return;       // manual pin test in progress
+    if (s_buzzManual) {
+        if (now >= s_buzzManualUntilMs) {
+            s_buzzManual = false;
+            buzzReleasePin();          // restore the pad, then resume auto drive
+            Serial.println("buzzpin=auto (manual pin test timed out)");
+        }
+        return;                         // manual pin test in progress
+    }
     if (now - last < 100) return;   // 10 Hz — matches display cadence
     last = now;
     bool on;
@@ -2663,6 +2695,7 @@ static void handleCommand(const String& line) {
                 // `X 3` holds the pin hard LOW and updateBuzzer() early-returns
                 // on s_buzzManual, so applyPinConfig() alone does NOT release it.
                 s_buzzManual = false;
+                s_buzzManualUntilMs = 0;
                 s_buzzLoop   = false;
                 s_fullPctSinceCal = -1;  s_fullMvSinceCal  = -1;
                 s_emptyPctSinceCal = 101; s_emptyMvSinceCal = -1;
@@ -2992,7 +3025,8 @@ static void handleCommand(const String& line) {
                                   val.c_str(), g_cfg.pin.iac);
                     break;
                 }
-                s_buzzManual = true;                 // pause auto drive; X 9 gives it back
+                s_buzzManual = true;                 // pause auto drive; X 9 or the timeout gives it back
+                s_buzzManualUntilMs = millis() + BUZZ_MANUAL_MS;
                 if      (val == "0") { pinMode(g_cfg.pin.buzz, INPUT_PULLUP); Serial.println("buzzpin=input_pullup"); }
                 else if (val == "1") { pinMode(g_cfg.pin.buzz, INPUT);         Serial.println("buzzpin=float"); }
                 else if (val == "2") { pinMode(g_cfg.pin.buzz, OUTPUT); digitalWrite(g_cfg.pin.buzz, HIGH); Serial.println("buzzpin=high_3v3"); }
@@ -3000,16 +3034,16 @@ static void handleCommand(const String& line) {
             }
             else if (val == "9") {
                 s_buzzManual = false;
+                s_buzzManualUntilMs = 0;
                 // X 9 used to clear the manual flag only. After `X 0` or `X 1` the
                 // pin was still INPUT, so updateBuzzer()'s digitalWrite() was a
                 // no-op and the buzzer stayed dead until a reboot — the command
-                // that is supposed to RESTORE the pin did not restore it. Re-run
-                // the same configuration applyPinConfig() establishes, and keep
-                // the "never touch the IAC pin" guard it has.
+                // that is supposed to RESTORE the pin did not restore it. It now
+                // calls the same buzzReleasePin() the manual-test timeout uses, so
+                // there is exactly one implementation of "give the pad back" and
+                // the two paths cannot drift apart again.
                 if (g_cfg.pin.buzz != g_cfg.pin.iac) {
-                    pinMode(g_cfg.pin.buzz, OUTPUT);
-                    gpio_pullup_en((gpio_num_t)g_cfg.pin.buzz);
-                    digitalWrite(g_cfg.pin.buzz, HIGH);   // inverted: HIGH = silent
+                    buzzReleasePin();
                     Serial.println("buzzpin=auto (output restored)");
                 } else {
                     /* This used to print "output restored" unconditionally, on
