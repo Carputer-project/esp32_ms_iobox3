@@ -3243,6 +3243,35 @@ static bool pinOk(uint8_t p) {
      *   15 = GAS_SCLK, 16 = GAS_MOSI, 21 = GAS_DC — the idle display's
      *        software-SPI pins are hardcoded at :28-31. */
     if (p == 4 || p == 5 || p == 15 || p == 16 || p == 21) return false;
+    /* GPIO12 (MTDI) is the last strapping pin this function was letting
+     * through, so the rejection message above ("no strapping ... pins")
+     * contradicted the code. It is sampled at reset to pick the flash supply
+     * voltage and must be LOW at boot for a 3.3 V flash; a HIGH there selects
+     * 1.8 V and the next reset does not boot. Reachable as a relay target:
+     *
+     *   P O2 22   frees out[1] = GPIO12
+     *   P O3 12   pinAliasFree(12, 2) passes -- out[1] is skip_idx, 12 is not
+     *             iac/buzz/ledData/speed/gas/display and not any other out[]
+     *             entry -- so O3 was moved onto a strapping pin, and O3 is a
+     *             channel that gets driven HIGH by the shift/rpm modes, which
+     *             is the level that can stop the next boot.
+     *
+     * NEW ASSIGNMENTS ONLY, deliberately. loadCfg() does not call this
+     * function - it checks blob length and magic and nothing else - so a stored
+     * map that already contains GPIO12 loads and runs completely unchanged,
+     * and nothing rewrites it. That distinction matters here because GPIO12 IS
+     * PIN_O2_DEF: out[1] is 12 in the factory default map, so any rule that
+     * rejected a CONFIG containing GPIO12 would reject the default itself and
+     * the installed box. This function has exactly one call site, the `P`
+     * command's pin-assignment arm, so adding the pin here gates new commands
+     * and nothing else. `P O2 12` no longer restores it, but `P RESET`
+     * (g_cfg.pin = PinMap{}) still does.
+     *
+     * Note the limitation this does NOT fix: because 12 is the default out[1],
+     * a stored map can still hold it and still drive it HIGH via outMode[1] =
+     * OM_MAN. Removing 12 from the factory map is a hardware-visible change to
+     * PIN_O2_DEF and is not done here. */
+    if (p == 12) return false;
     return p <= 39;
 }
 
