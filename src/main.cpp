@@ -798,6 +798,12 @@ static uint16_t engineWarnFlags() {
     if (!s_canFresh) return 0;
     bool cltOk = groupSeen(2) && g_clt > 100 && g_clt < 3500;
     bool matOk = groupSeen(2) && g_mat > 0 && g_mat < 3000;
+    /* map had no reading sanity gate at all, unlike clt/mat/afr. `g_map > 0`
+     * is the minimum: a zero or absent reading is not evidence of overboost.
+     * With no gate, a stored threshold of 0 (reachable until the W map range
+     * floor was raised) matched every positive MAP - i.e. every running
+     * engine - and latched W_OVERBOOST permanently. */
+    bool mapOk = groupSeen(2) && g_map > 0 && g_map < 4000;
     bool onThrottle = groupSeen(3) && g_tps >= 50;
     bool afrOk = onThrottle && g_afr >= 100 && g_afr <= 250;
 
@@ -816,7 +822,7 @@ static uint16_t engineWarnFlags() {
     if (matOk && g_mat > g_cfg.eng.matMax) raw |= W_HOTAIR;
     if (battOk && g_batt > 0 && g_batt < g_cfg.eng.battMin) raw |= W_LOWBATT;
     if (battOk && g_batt > 0 && g_batt > g_cfg.eng.battMax) raw |= W_HIBATT;
-    if (groupSeen(2) && g_map > g_cfg.eng.mapMax) raw |= W_OVERBOOST;
+    if (mapOk && g_map > g_cfg.eng.mapMax) raw |= W_OVERBOOST;
     if (afrOk && g_afr > g_cfg.eng.afrHigh) raw |= W_LEAN;
     if (afrOk && g_afr < g_cfg.eng.afrLow) raw |= W_RICH;
     return raw;
@@ -2785,9 +2791,13 @@ static void handleCommand(const String& line) {
              *                     buzzer every second, warn relay blinking,
              *                     and saveCfg() makes it survive a power cycle.
              *   W mat nan      ->  50.0 F => 107 >  50 => W_HOTAIR, continuously.
-             *   W map nan      ->   0.0 kPa. This check has no sanity gate at
-             *                     all (no mapOk), so 98 > 0 => W_OVERBOOST,
-             *                     continuously.
+             *   W map nan      ->   0.0 kPa. At the time of this audit this
+             *                     check had no sanity gate at all, so 98 > 0 =>
+             *                     W_OVERBOOST, continuously. Two later fixes
+             *                     closed that: `mapOk` now exists, and the W map
+             *                     range floor was raised from 0 to 1000, because
+             *                     a well-formed `W map 0` reached it regardless
+             *                     and idle MAP is already 30-100 kPa.
              *   W batt nan nan ->   5.0 V, which is UNDER a resting battery, so
              *                     it is an OVER-voltage reading: 126 > 50 =>
              *                     W_HIBATT, continuously.
@@ -2890,7 +2900,30 @@ static void handleCommand(const String& line) {
                 g_cfg.eng.battMax = (int16_t)mx;
             } else if (k == "map" && p1.length() > 0) {
                 int t;
-                if (!num10(p1, 0, 4000, t)) { reject(k, p1); break; }
+                /* Floor 1000 = 100 kPa, and it is not arbitrary. MAP at idle is
+                 * already ~30-100 kPa (300-1000 in the x10 units this channel
+                 * uses), so ANY threshold below that is exceeded the moment the
+                 * engine starts and latches W_OVERBOOST permanently - buzzer
+                 * every second, warn relay blinking, threshold persisted.
+                 *
+                 * `map` was the only one of the nine numeric W sub-commands
+                 * whose range floor was 0. clt floors at 1000, mat at 500, afr
+                 * at 50, batt at 50, maxrpm at 1000. A zero floor there is not
+                 * "permissive", it is a value that cannot mean anything, and it
+                 * was reachable with a perfectly well-formed argument - the
+                 * malformed-input validation added in 8b93a28 could not catch
+                 * it because `0` is a number.
+                 *
+                 * Ceiling 4000 = 400 kPa, unchanged: well above the 165 kPa
+                 * boost target this engine is aiming at.
+                 *
+                 * Note num10() CLAMPS an out-of-range number to the bound
+                 * rather than refusing it, so `W map 0` now lands on 100 kPa
+                 * instead of being rejected. That is the same `constrain()`
+                 * behaviour the other sub-commands have always had, and it is
+                 * what makes this safe: the stored value cannot be 0 whatever
+                 * is typed. */
+                if (!num10(p1, 1000, 4000, t)) { reject(k, p1); break; }
                 g_cfg.eng.mapMax = (int16_t)t;
             } else if (k == "afr" && a > 0) {
                 int lo, hi;
