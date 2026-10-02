@@ -2769,7 +2769,20 @@ static void handleCommand(const String& line) {
                 // (now refused over the air, but a stored one can survive a
                 // firmware downgrade), the box rejected the real dash and only a
                 // hand-edited NVS could recover it.
-                g_prefs.clear();
+                /* Preferences::clear() returns whether the namespace was
+                 * actually erased, and it was discarded here. s_nvsOk says
+                 * nothing about THIS call - it is latched once at boot from
+                 * g_prefs.begin() - so a namespace that opened successfully and
+                 * then went read-only or full (NVS partition full is a real
+                 * state, not a hypothetical) printed "FACTORY RESET ... Reboot
+                 * not required" for a reset that neither happened nor persists.
+                 * That is the exact class of lie the comments around this block
+                 * exist to prevent, and it is why the return was worth reading.
+                 *
+                 * Prefer reports_harmless=false so the operator is told a reset
+                 * did not happen, rather than being handed a silent no-op that
+                 * looks like a success. */
+                const bool wipeOk = g_prefs.clear();
                 g_cfg = Cfg{};
                 memcpy(g_cfg.gasCalMv, kGasStockMv, sizeof(g_cfg.gasCalMv));
                 saveCfg();
@@ -2805,12 +2818,20 @@ static void handleCommand(const String& line) {
                 tftReinitRequest();
                 Serial.println("FACTORY RESET: cfg + gas table + gas log + peer filters + A1-A4 polarity");
                 Serial.println("              + LED bar + buzzer overrides, all back to defaults.");
-                if (s_nvsOk) {
+                if (s_nvsOk && wipeOk) {
                     Serial.println("              Reboot not required.");
-                } else {
+                } else if (!s_nvsOk) {
                     // True today, false on the next boot: every put above was a
                     // no-op. Do not let the message promise a persistent reset.
                     Serial.println("              *** NVS IS NOT OPEN — NONE OF THIS WILL SURVIVE A REBOOT. ***");
+                } else {
+                    /* NVS opened at boot, but this erase did not happen: the
+                     * namespace is most likely full or read-only. The settings
+                     * below are live in RAM, so the box looks reset, and the
+                     * stored config survives a reboot intact - the operator is
+                     * told a reset that did not occur. */
+                    Serial.println("              *** THE ERASE FAILED (NVS full or read-only). ***");
+                    Serial.println("              *** Settings changed but will NOT survive a reboot. ***");
                 }
                 break;
             }
