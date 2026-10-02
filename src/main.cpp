@@ -798,7 +798,52 @@ static void decodeOutpc() {
 // CAN-less simulation and boot self-test REMOVED (never inject synthetic ECU
 // data — the box only ever mirrors real dash 0xA0 frames).
 static uint16_t s_warnRaw = 0;
-static uint32_t s_warnFirstMs = 0;
+
+/* Per-bit hold deadlines for s_warnLatched, indexed by bit position.
+ *
+ * There used to be ONE timer for the whole mask (s_warnFirstMs), armed when the
+ * mask went non-empty, and the mask was refreshed by ASSIGNMENT:
+ *
+ *     s_warnLatched = s_warnRaw;            // assignment, not |=
+ *
+ * That silently downgrades an already-latched warning the moment a
+ * lower-priority one appears. W_OVERHEAT latches at t=0; at t=500 it clears and
+ * LOWBATT appears; the assignment replaces the mask in a single pass, and
+ * topWarnName() resolves priority only WITHIN one mask, so the box reported
+ * LOWBATT and the warn relay blinked for the wrong condition. The displaced bit
+ * left no trace anywhere, so it could not be recovered afterwards.
+ *
+ * The single timer was the second half of the same defect. The hold was
+ * anchored to the first warning of ANY kind, so the displaced warning's
+ * remaining hold was lost rather than deferred, and s_warnFirstMs was not
+ * rearmed — the mask then expired 2.5 s into a 3000 ms hold.
+ *
+ * MODEL CHOSEN: per-bit expiry. Every bit carries its own deadline and
+ * s_warnLatched is OR-ed rather than assigned, so a bit still inside its own
+ * hold window cannot be dropped by a lower-priority bit turning up. A global
+ * hold that only OR-ed was the alternative and is not sufficient — it would
+ * still let the mask be emptied as a unit (one bit's expiry retiring another
+ * bit's hold), and it forces every bit to share the first warning's deadline,
+ * which is precisely the coupling being removed here.
+ *
+ * A bit's deadline is re-anchored on every pass while that bit is RAW, so it
+ * always holds the last time that specific bit was actually true. That is what
+ * makes "hold" mean the same thing for every bit: warnHoldMs is measured from
+ * when the condition stopped being true, not from when some unrelated
+ * condition first appeared. A warning true for 30 s is shown for the full
+ * warnHoldMs after it clears, instead of expiring on the same pass.
+ *
+ * This is a deliberate behaviour change for the long-warn case. The old single
+ * timer was armed once at the first warning of any kind and never re-armed, so
+ * a warning that stayed true for longer than warnHoldMs expired the instant it
+ * cleared, with no hold at all. The change is limited to that: a lone warning
+ * that appears and disappears still holds for warnHoldMs, and is the only case
+ * where behaviour matches the old code exactly.
+ *
+ * Indexed across all 16 bit positions rather than a list of the ten known
+ * warnings, so a bit added later is timed by construction and cannot fall
+ * through as a latch that never expires. */
+static uint32_t s_warnBitMs[16] = {0};
 
 static const char* kTopWarnOrder[] = {
     "OVERHEAT", "OVERBOOST", "OVERREV", "LOWBATT", "HIBATT",
@@ -863,11 +908,25 @@ static void updateEngineProfile() {
         return;
     }
     s_warnRaw = engineWarnFlags();
-    if (s_warnRaw) {
-        if (!s_warnLatched) s_warnFirstMs = millis();
-        s_warnLatched = s_warnRaw;
-    } else if (s_warnLatched && (millis() - s_warnFirstMs) >= g_cfg.eng.warnHoldMs) {
-        s_warnLatched = 0;
+    uint32_t now = millis();
+
+    /* Latch OR raw: a bit that is present NOW is held. Assignment (`=`) here
+     * is what let a lower-priority warning erase a latched higher-priority one;
+     * see the note on s_warnBitMs. */
+    s_warnLatched |= s_warnRaw;
+
+    /* Re-anchor each still-present bit's own deadline, then retire only the
+     * bits that are gone AND have served their own full hold. Clearing the
+     * mask as a unit (the old `s_warnLatched = 0`) is what dropped an
+     * in-flight higher-priority hold early. */
+    for (uint8_t bit = 0; bit < 16; bit++) {
+        uint16_t m = (uint16_t)(1u << bit);
+        if (!(m & s_warnLatched)) continue;
+        if (m & s_warnRaw) {
+            s_warnBitMs[bit] = now;
+        } else if ((now - s_warnBitMs[bit]) >= g_cfg.eng.warnHoldMs) {
+            s_warnLatched &= (uint16_t)~m;
+        }
     }
 }
 
