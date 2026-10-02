@@ -1394,6 +1394,34 @@ static bool gasAnchorSane(int32_t mv) {
     return mv > 1000 && mv < 30000;
 }
 
+/* WHICH MID ANCHORS ARE IN EFFECT: the operator's / factory's curve, or a
+ * straight taper?
+ *
+ * Provenance is INFERRED from the numbers, not stored. gasRelinMids() always
+ * writes the exact straight taper between the current endpoints, so any mid
+ * that is not that taper carries knowledge the taper cannot reproduce: either a
+ * `Q 1/2/3` refinement taken at a fuel level the operator could see, or the
+ * factory curve itself - kGasStockMv's mids are 4800/9800/16418 and are NOT the
+ * taper of its own 1009..25014 endpoints (that is 7010/13011/19012). One test
+ * separates the two cases exactly.
+ *
+ * A stored flag would be cleaner state and is not an option: loadCfg() rejects
+ * any blob whose length != sizeof(g_cfg), so one added bit in struct Cfg wipes
+ * the pin map, the engine profile and the calibration on every box in the field.
+ * Inferring it also keeps `Q R` a pure data restore - it has no flag to clear,
+ * and the factory curve it just wrote is immediately reported as "in effect".
+ *
+ * Called on every display pass (updateGasDisplay) to tell the operator which
+ * shape the gauge is using, so read-only and cheap. */
+static bool gasMidsAreExplicit() {
+    const uint16_t *c = g_cfg.gasCalMv;
+    int32_t lo = min((int32_t)c[0], (int32_t)c[4]);
+    int32_t hi = max((int32_t)c[0], (int32_t)c[4]);
+    for (uint8_t j = 1; j < 4; j++)
+        if ((int32_t)c[j] != lo + (int32_t)((uint32_t)(hi - lo) * j) / 4) return true;
+    return false;
+}
+
 static int gasPctFromMv(int16_t mv) {
     uint16_t c[5];
     gasCalMapTable(c);
@@ -1545,6 +1573,56 @@ static void gasLogUpdate() {
     gasAutoCal();
 }
 
+/* Fill the three mid anchors between the CURRENT FULL/EMPTY pair.
+ *
+ * keepExplicit: the stored mids are a `Q 1/2/3` refinement or the factory curve
+ * (see gasMidsAreExplicit) and only the slots that still fit monotonically
+ * between the new endpoints are kept. false when the endpoint that moved was
+ * itself off-scale, i.e. the mids were interpolated from a table that is not a
+ * tank calibration and there is nothing to salvage.
+ *
+ * The taper is computed from the SORTED anchor pair, which makes it
+ * bit-identical to the two branches it replaces for both slopes (ascending
+ * through the slots when FULL is the low anchor, descending when it is the high
+ * one) - checked equal on {1009, 25014} and {25014, 1009} - while collapsing
+ * them into one loop that is allowed to decline to write. */
+static void gasRelinMids(bool keepExplicit) {
+    int32_t a = g_cfg.gasCalMv[0];        // FULL
+    int32_t b = g_cfg.gasCalMv[4];        // EMPTY
+    if (a == b) return;   // zero span: nothing to interpolate between, and
+                          // gasCalMapTable() rejects the table anyway. The old
+                          // two-branch form fell through here too and wrote
+                          // nothing, so this is not a behaviour change.
+    int32_t dir = (a < b) ? 1 : -1;        // +1 = ascending through the slots
+    int32_t lo  = dir > 0 ? a : b;
+    int32_t hi  = dir > 0 ? b : a;
+    uint8_t kept = 0;
+    bool changed = false;
+    for (uint8_t j = 1; j < 4; j++) {
+        int32_t taper = lo + (int32_t)((uint32_t)(hi - lo) * j) / 4;
+        int32_t have  = g_cfg.gasCalMv[j];
+        if (have != taper) changed = true;
+        if (keepExplicit && have != taper) {
+            /* Walked in slot order so the neighbours are already resolved. A mid
+             * that no longer fits between them would hand gasPctFromMv a
+             * non-monotonic segment list, and it does not detect that - it just
+             * returns a wrong percentage with nothing on the console to say so. */
+            int32_t prev = (j == 1) ? a : g_cfg.gasCalMv[j - 1];
+            int32_t next = (j == 3) ? b : g_cfg.gasCalMv[j + 1];
+            if (dir * (have - prev) > 0 && dir * (next - have) > 0) { kept++; continue; }
+        }
+        g_cfg.gasCalMv[j] = (uint16_t)taper;
+    }
+    if (kept == 3)
+        Serial.println("gas auto-cal: mids KEPT (operator/factory curve still fits)");
+    else if (kept)
+        Serial.printf("gas auto-cal: %u of 3 mids kept, the rest re-tapered\n", kept);
+    else if (changed)
+        Serial.println("gas auto-cal: mids re-tapered (straight taper)");
+    // Silent when the mids already were the taper: rewriting three identical
+    // values is not an event.
+}
+
 // Auto-calibrate the E/F anchors from the float's REAL extremes recorded in
 // the tank log: once the float has actually reached near-full and near-empty,
 // commit those measured mV as the FULL/EMPTY anchors and re-linearise the
@@ -1639,6 +1717,7 @@ static void gasAutoCal() {
     constexpr int32_t GAS_CAL_VALID_HI = 30000;
 
     int32_t fOld = g_cfg.gasCalMv[0];
+    bool fBroken = false;   // set only if the FULL anchor is replaced below
     if (fMv > GAS_CAL_VALID_LO && fMv < GAS_CAL_VALID_HI && fMv != fOld) {
         int32_t band  = inverted ? fOld + GAS_CAL_BAND_MV : fOld - GAS_CAL_BAND_MV;
         bool better   = inverted ? (fMv > fOld) : (fMv < fOld);
@@ -1673,7 +1752,7 @@ static void gasAutoCal() {
          * rejected table means the stock span - i.e. a genuine full-tank
          * voltage. The escape cannot write noise, only the end of the scale that
          * the whole auto-cal feature exists to capture. */
-        bool fBroken = !gasAnchorSane(fOld);
+        fBroken = !gasAnchorSane(fOld);
         if (fBroken || (better && clears)) {
             g_cfg.gasCalMv[0] = (uint16_t)fMv;                       // FULL anchor
             dirty = relin = true;
@@ -1682,11 +1761,12 @@ static void gasAutoCal() {
         }
     }
     int32_t eOld = g_cfg.gasCalMv[4];
+    bool eBroken = false;  // set only if the EMPTY anchor is replaced below
     if (eMv > GAS_CAL_VALID_LO && eMv < GAS_CAL_VALID_HI && eMv != eOld) {
         int32_t band  = inverted ? eOld - GAS_CAL_BAND_MV : eOld + GAS_CAL_BAND_MV;
         bool better   = inverted ? (eMv < eOld) : (eMv > eOld);
         bool clears   = inverted ? (eMv <= band) : (eMv >= band);
-        bool eBroken = !gasAnchorSane(eOld);  // same escape as FULL, see above
+        eBroken = !gasAnchorSane(eOld);   // same escape as FULL, see above
         if (eBroken || (better && clears)) {
             g_cfg.gasCalMv[4] = (uint16_t)eMv;                       // EMPTY anchor
             dirty = relin = true;
@@ -1694,17 +1774,36 @@ static void gasAutoCal() {
                           eBroken ? " (replacing off-scale EMPTY anchor)" : "");
         }
     }
-    if (relin && g_cfg.gasCalMv[0] < g_cfg.gasCalMv[4]) {
-        for (uint8_t j = 1; j < 4; j++)
-            g_cfg.gasCalMv[j] = g_cfg.gasCalMv[0] +
-                (uint16_t)((uint32_t)(g_cfg.gasCalMv[4] - g_cfg.gasCalMv[0]) * j / 4);
-        Serial.println("gas auto-cal: mids re-linearised");
-    } else if (relin && g_cfg.gasCalMv[0] > g_cfg.gasCalMv[4]) {
-        // Inverted slope: mids descend from the FULL (high-mV) anchor.
-        for (uint8_t j = 1; j < 4; j++)
-            g_cfg.gasCalMv[j] = g_cfg.gasCalMv[4] +
-                (uint16_t)((uint32_t)(g_cfg.gasCalMv[0] - g_cfg.gasCalMv[4]) * j / 4);
-        Serial.println("gas auto-cal: mids re-linearised (inverted)");
+    if (relin) {
+        /* The old code re-tapered the three mids unconditionally, which silently
+         * undid any `Q 1/2/3` refinement on the next full-to-empty drive. The
+         * only trace was one line on Serial, and the dash is sent nothing but the
+         * percentage in f[5], so from the driver's seat the calibration silently
+         * stopped being the one they set.
+         *
+         * It also made the mid-scale reading DRIFT. A 50 mV nudge of the FULL
+         * anchor re-tapered 1/2 from 9800 mV to 13014 mV - a 33% move of the
+         * half-tank point - for a change at the very top of the scale.
+         *
+         * POLICY: the operator's and the factory's mid anchors WIN.
+         *
+         * They and the endpoints are independent measurements. A mid is the
+         * sender voltage at a fuel level somebody could see (or the OE curve);
+         * an endpoint is the voltage at a stop. The same 11000 mV is still half
+         * a tank after the FULL anchor moves, so discarding it loses information
+         * rather than maintaining a curve. The derived taper exists to fill slots
+         * that were never measured, not to overrule the ones that were.
+         *
+         * THE EXCEPTION, and it is the M11 escape: if the endpoint that just
+         * moved was itself off-scale, the mids that came with it were
+         * interpolated from a table that is not a tank calibration at all. There
+         * is nothing to salvage and the straight taper is the honest answer, so
+         * a table being rescued is rebuilt flat and a healthy one is not.
+         *
+         * Whatever is kept must still be monotonic, or gasPctFromMv walks a
+         * non-monotonic segment list and returns a wrong percentage without any
+         * indication that anything is wrong. */
+        gasRelinMids(!(fBroken || eBroken));
     }
     if (dirty) {
         s_gasFilt = -1;                          // reseed filter after cal change
@@ -1774,6 +1873,11 @@ static char s_lastGasLo[8] = "";
 static char s_lastGasHi[8] = "";
 static char s_lastGasLoMv[8] = "";
 static char s_lastGasHiMv[8] = "";
+// Delta tracker for the "CAL"/"CAL*" mid-curve indicator (see
+// gasMidsAreExplicit). File scope with the rest of them so drawGasFrame() can
+// invalidate it, and forced in updateGasDisplay()'s needle-erase path because
+// the black triangle reaches r=118 and clips anything under it.
+static char s_lastGasCal[8] = "";
 static bool  s_needleDrawn = false;
 static float s_needleDeg = 0.0f;
 static int   s_gasDisp = -1;
@@ -1848,6 +1952,7 @@ static void drawGasFrame() {
     s_blinkPhase = false;
     s_lastGasMv[0] = s_lastGasPct[0] = s_lastGasLow[0] = s_lastGasLo[0] = s_lastGasHi[0] = 0;
     s_lastGasLoMv[0] = s_lastGasHiMv[0] = 0;
+    s_lastGasCal[0] = 0;
     s_lastPctColor = s_lastLowColor = 0xFFFF;
     // The float-history band is static-delta-tracked, so it MUST be invalidated
     // here or it is lost for the life of the frame. It used to be a
@@ -1887,6 +1992,12 @@ static void updateGasDisplay() {
         drawGasTick((float)gasRound6(s_needleDeg), GC9A01A_DARKGREY);  // patch the scale
         for (int p = 0; p <= 100; p += 25) drawGasMajorTick((float)gasAngleDeg(p));
         drawGasMarks();
+        // The black triangle runs out to r=118, so it clips the CAL indicator
+        // too. Its delta tracker would otherwise still read "up to date" and the
+        // text would stay cut in half until the calibration changed for some
+        // other reason. Forcing the tracker here costs one 4-character redraw on
+        // a pass that already repaints three labels above.
+        s_lastGasCal[0] = 0;
     }
     if (blinkChange || lowChange) {
         uint16_t alarmColor = phase ? GC9A01A_RED : GC9A01A_DARKGREY;
@@ -1915,6 +2026,21 @@ static void updateGasDisplay() {
     snprintf(buf, sizeof buf, "%d%%", s_gasDisp);
     uint16_t pctColor = low ? (phase ? GC9A01A_RED : GC9A01A_DARKGREY) : GC9A01A_CYAN;
     drawGasText(88, 208, 2, 68, pctColor, s_lastGasPct, &s_lastPctColor, buf);
+
+    /* WHICH MID CURVE IS IN EFFECT, on the panel.
+     *
+     * The operator's decision about the mid anchors used to leave no trace
+     * anywhere but Serial, and the dash is sent nothing but the percentage in
+     * f[5] - so "my Q 2 was quietly thrown away on the next drive" was
+     * indistinguishable, from the driver's seat, from the calibration simply
+     * being right. This is the whole visible difference: '*' means the
+     * operator's or the factory's curve is in force, no '*' means auto-cal left
+     * a straight taper. Constant DARKGREY, matching the 1/4 / 1/2 / 3/4 labels,
+     * so it reads as gauge furniture and never competes with the cyan or red
+     * data. Delta-tracked, so it is one strcmp per pass and no drawing at all
+     * unless the state changed or the needle clipped it. */
+    drawGasText(40, 196, 1, 34, GC9A01A_DARKGREY, s_lastGasCal, nullptr,
+                gasMidsAreExplicit() ? "CAL*" : "CAL");
 
     // Min/Max tank-float log: a yellow band on the tick ring tracing the
     // sweep the float has covered (from LO% up to HI%). The needle already
