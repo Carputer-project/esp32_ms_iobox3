@@ -3267,10 +3267,51 @@ static bool pinAliasFree(uint8_t p, int skip_idx, uint8_t assigning) {
     return true;
 }
 
+/* True if the firmware drives this pad for ANY purpose - a relay, the valve,
+ * the buzzer, the LED bar, the ABS input, or either display. Used to decide
+ * whether a pad that has fallen out of the pin map can safely be released. */
+static bool pinInUseAnywhere(uint8_t p) {
+    for (int i = 0; i < 7; i++) if (g_cfg.pin.out[i] == p) return true;
+    if (p == g_cfg.pin.iac || p == g_cfg.pin.buzz || p == g_cfg.pin.ledData) return true;
+    if (p == PIN_SPEED || p == GAS_SCLK || p == GAS_MOSI || p == GAS_CS || p == GAS_DC) return true;
+    if (p == g_cfg.pin.tftSclk || p == g_cfg.pin.tftMosi) return true;
+    if (p == g_cfg.pin.tftCs   || p == g_cfg.pin.tftDc)   return true;
+    return false;
+}
+
 static void applyPinConfig() {
     // NOTE: no heartbeat LED — GPIO2 is the gas-gauge TFT CS (GAS_CS).
     // The old PIN_LED=2 blink yanked the display's chip-select every
     // 120ms. Board has zero spare GPIOs, so the status LED is retired.
+
+    /* Release pads this function drove last time that the new map no longer
+     * uses. Without this, `P O1 22` leaves the OLD relay pin a latched OUTPUT
+     * holding whatever level it last had - a shift-light relay stays energised
+     * until `P O1 <old pin>` or a reboot, and nothing else will ever bring it
+     * low. outputsOff() below only writes the NEW map, so it cannot help.
+     *
+     * The P BZ arm already has to do exactly this by hand for the buzzer when a
+     * manual pin test is live; this is the general case, and the remembered map
+     * is what lets applyPinConfig() see the old assignment at all - it takes no
+     * arguments and had no way to know. */
+    static uint8_t s_lastOut[7]  = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+    static uint8_t s_lastIac      = 0xFF;
+    static bool    s_haveApplied = false;
+
+    if (s_haveApplied) {
+        for (uint8_t i = 0; i < 7; i++) {
+            uint8_t p = s_lastOut[i];
+            if (p != 0xFF && !pinInUseAnywhere(p)) {
+                pinMode(p, INPUT);            // nobody drives it now; let it float
+                gpio_pullup_dis((gpio_num_t)p);
+            }
+        }
+        if (s_lastIac != 0xFF && s_lastIac != g_cfg.pin.iac && !pinInUseAnywhere(s_lastIac)) {
+            ledcDetachPin(s_lastIac);
+            pinMode(s_lastIac, INPUT);
+        }
+    }
+
     for (uint8_t i = 0; i < 7; i++) pinMode(g_cfg.pin.out[i], OUTPUT);
     ledcDetachPin(g_cfg.pin.iac);
     // Rotary-solenoid IAC (Toyota ISC): spec frequency 250Hz. 30Hz made the
@@ -3284,6 +3325,10 @@ static void applyPinConfig() {
     }
     outputsOff();
     setIac(0);
+
+    for (uint8_t i = 0; i < 7; i++) s_lastOut[i] = g_cfg.pin.out[i];
+    s_lastIac      = g_cfg.pin.iac;
+    s_haveApplied  = true;
 }
 
 void setup() {
