@@ -6,6 +6,9 @@
 #include <SPI.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_GC9A01A.h>
+// esp_task_wdt_init()/esp_task_wdt_status() are not reachable via Arduino.h;
+// esp32-hal.h declares only the core helpers (enableLoopWDT et al).
+#include <esp_task_wdt.h>
 
 // Old CAN pins (GPIO4/5) are now FREE — the SN65HVD230 transceiver is gone.
 // PIN_LED retired: GPIO2 is owned by the gas-gauge TFT CS (GAS_CS below).
@@ -3093,6 +3096,101 @@ static void applyPinConfig() {
 void setup() {
     Serial.begin(115200);
     delay(200);
+
+    /* ---- Loop watchdog -------------------------------------------------
+     *
+     * There was NO watchdog of any kind before this. The TWDT was never
+     * initialised: arduino-esp32's loopTask() calls esp_task_wdt_reset() but
+     * only behind loopTaskWDTEnabled, which app_main() sets to false, and the
+     * core never calls esp_task_wdt_init() itself. So a hung loop() was
+     * indistinguishable from a running one. The box would stop driving the fan
+     * relay, the IAC and the buzzer, stop sending the 10 Hz status frame, stop
+     * the ABS speed window and stop the gas log - and from the driver's seat
+     * the gauges would simply freeze, with nothing indicating anything was
+     * wrong. That is the failure this is here to catch.
+     *
+     * TIMEOUT = 15 s, and why that number is not marginal. Worst legitimate
+     * single pass, itemised from this file's own measured costs:
+     *
+     *   max( 365, 300 ) + 200 + 300 + 20  ~=  885 ms, call it ~1 s
+     *
+     *   365 ms  the 10 Hz display block, updateDisplay() + updateGasDisplay()
+     *           in one pass. ~180 ms per full-frame-equivalent (the measured
+     *           cost of fillScreen() over software SPI, cited at the
+     *           tftReinitStep comment), x2 = 360, plus ~5 ms for the two annuli
+     *           a low-fuel transition adds: updateGasDisplay() draws r=118 and
+     *           r=119 1px circles, ~1490 px between them, at the ~3.1 us/px
+     *           implied by 57600 px = 180 ms.
+     *   300 ms  tftReinitStep(): begin() is the worst single step. This is a
+     *           max(), NOT a sum with the 365 above, and provably so: the
+     *           display guard requires s_tftStep == TFT_IDLE, and
+     *           tftReinitStep() returns immediately in TFT_IDLE. The two
+     *           expensive paths can never share a pass.
+     *   200 ms  gasLogUpdate() -> gasLogSave() on a new lifetime extreme: an
+     *           NVS commit, i.e. a flash erase. Not measured in this file.
+     *   300 ms  handleCommand(), one command per pass: worst is `P WIPE`, whose
+     *           g_prefs.clear() erases the whole namespace. No command calls
+     *           initTft()/initGasTft() synchronously, so a command does not
+     *           also drag in a ~600 ms display block.
+     *    20 ms  everything else: ADC latch, decodeOutpc(), updateOutputs(),
+     *           the 100 ms espnowSendStatus(), delay(2).
+     *
+     * 15 s / 1 s = 15x. Even if all three unmeasured items are 4x pessimistic
+     * (a ~2.5 s worst pass) it is still 6x. This API takes SECONDS, so 15 is
+     * the next step above 10; the sdkconfig default of 5 s would be only 5x
+     * over the estimate and 2x over the pessimistic case, which is too tight
+     * for a box that must never reset itself in normal use.
+     *
+     * BOOT SAFETY: armed here, at the top of setup(), before the ~1 s of
+     * initTft()/initGasTft(). The countdown starts at esp_task_wdt_add(), and
+     * the core only feeds inside loopTask's for(;;), so setup() spends ~1 s of
+     * its 15 s budget unfed: worst first pass ~1.9 s against 15 s, ~8x. If
+     * setup() ever did exceed 15 s it would reset-loop, and at that point that
+     * IS a hang worth recovering from. Honest limit: a hang inside setup() is
+     * only caught because it costs more than the whole timeout - loopTask is
+     * not fed during setup(), so nothing shorter is detectable there.
+     *
+     * RECOVERY: panic=true, so a timeout runs the panic handler, which with
+     * CONFIG_ESP_SYSTEM_PANIC_PRINT_REBOOT=y prints the reason and backtrace
+     * on the console and REBOOTS the chip (PANIC_PRINT_HALT is not set). It is
+     * a software reset, milliseconds - not a power cycle.
+     *
+     * RESET SAFETY: nothing needs saving first, and nothing safe can be forced
+     * first. Every persistent value is written to NVS at the point it changes
+     * (saveCfg() on each config change, gasLogSave() on a new extreme), so a
+     * reset loses nothing a power cycle would not also lose, and nothing here
+     * lives in RTC memory. The TWDT has no callback and a panic handler runs
+     * with interrupts off on an arbitrary core, where digitalWrite() is not
+     * safe - so there is no pre-reset "park the pins" step, and none is faked
+     * here. A reset IS a power cycle from the actuators' point of view: the
+     * GPIO matrix resets and the pins float until applyPinConfig() runs, and
+     * since setFan() writes HIGH to turn the fan ON, the drivers are
+     * active-HIGH, so a floating input de-energises the relay and drops the
+     * IAC gate to 0%. That is the state the box powers up in on every power
+     * cycle today; the watchdog does not introduce it, it only makes it
+     * reachable mid-drive. Bounding that ~1 s float window needs
+     * applyPinConfig() (or a panic handler), both outside setup()/loop(), so
+     * it is reported rather than faked.
+     *
+     * SIDE EFFECT: initialising the TWDT also subscribes the CPU0 idle task
+     * (CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU0=y). It is fed from the idle
+     * hook and loopTask blocks in delay(2) at ~500 Hz, so it is fed far inside
+     * 15 s. Usefully, it also means a pure busy-spin in loop() - which never
+     * blocks, so never feeds either watchdog - is still caught, by the idle
+     * task.
+     */
+    const esp_err_t wdtInit = esp_task_wdt_init(15, /*panic=*/true);
+    enableLoopWDT();
+    /* Confirm the subscribe actually took. enableLoopWDT() sets its feeding flag
+     * only on ESP_OK and reports failure with log_e(), which CORE_DEBUG_LEVEL=0
+     * compiles away - so without this check a failed subscribe would leave the
+     * box silently watchdog-less, i.e. still exactly the bug being fixed.
+     * NULL == the calling task == loopTask. */
+    const esp_err_t wdtSub = esp_task_wdt_status(NULL);
+    if (wdtSub != ESP_OK) {
+        Serial.printf("WDT: LOOP WATCHDOG INACTIVE (init=%d sub=%d) - a hung loop will NOT self-recover.\n",
+                      (int)wdtInit, (int)wdtSub);
+    }
 
     // Do not ignore this. A failed NVS mount made every later put/get a no-op,
     // so the box would run on defaults and quietly DISCARD every setting the
