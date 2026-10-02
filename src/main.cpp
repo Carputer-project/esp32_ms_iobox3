@@ -3134,8 +3134,16 @@ static void handleCommand(const String& line) {
                               s_gasLog.maxPct, s_gasLog.maxMv);
             {
                 const uint16_t *gc = g_cfg.gasCalMv;
-                bool poisoned = (gc[0] >= 30000 || gc[4] >= 30000 || gc[0] < 1000 || gc[4] < 1000 || gc[0] == gc[4]);
-                if (poisoned)
+                /* This was a THIRD hand-written copy of the poison predicate, the
+                 * other two being inside gasCalMapTable() and gasAnchorSane().
+                 * Three copies of one predicate is three places for a future
+                 * change to miss, and the failure is silent and wrong: the
+                 * console would report the table healthy while the gauge mapped
+                 * against the stock span instead, or vice versa. Ask the owner,
+                 * which returns "was poisoned" directly.
+                 */
+                uint16_t eff[5];
+                if (gasCalMapTable(eff))
                     Serial.println("WARN: anchors off-scale/degenerate -> mapping STOCK span. Send Q R to reset, then SET FULL/SET EMPTY.");
                 else if (gc[0] > gc[4])
                     Serial.println("note: inverted sender slope (high mV = FULL) detected");
