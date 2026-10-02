@@ -2283,9 +2283,12 @@ static void handleCommand(const String& line) {
             break;
         }
         case 'O': {
-            if (val.length() < 2) return;
+            /* These two used to `return` with no message, so `O`, `O9`, `O99` and
+             * `O0` were indistinguishable from a lost command - the same defect
+             * the `Y` arm had. An output index out of range must say so. */
+            if (val.length() < 2) { Serial.println("O<n> <mode>, n=1..7"); break; }
             uint8_t n = (uint8_t)(val[0] - '1');
-            if (n > 6) return;
+            if (n > 6) { Serial.println("O<n> <mode>, n=1..7"); break; }
             String mode = val.substring(1);
             mode.trim();
             /* argIsInt() at the top of this file already exists because
@@ -2373,8 +2376,17 @@ static void handleCommand(const String& line) {
                     Serial.printf("O%u R 1000-20000 rpm (e.g. O%u R 7000)\n", n + 1, n + 1);
                 }
             } else {
-                g_cfg.outMode[n] = OM_MAN;
-                g_cfg.outManual[n] = (mode.toInt() != 0);
+                /* 0, 1, A, T and R are all handled above, so anything landing
+                 * here is an UNDOCUMENTED argument. It used to be interpreted as
+                 * manual on/off via `mode.toInt() != 0`, which is the same
+                 * always-on class the T and R branches above were fixed for: a
+                 * single unrecognised character latched the relay ON and
+                 * saveCfg()'d it. `O1 5`, `O1 x`, `O1 2` all meant "on".
+                 *
+                 * Refused rather than guessed - the documented set is exactly
+                 * 0, 1, A, T<degF>, R<rpm>, and a typo must not move a relay. */
+                accept = false;
+                Serial.printf("O%u 0|1|A|T<degF>|R<rpm> (got \"%s\")\n", n + 1, mode.c_str());
             }
             if (accept) saveCfg();
             break;
