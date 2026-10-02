@@ -349,7 +349,8 @@ static void outputsOff() {
 /* Which PinMap field a caller is about to overwrite, so pinAliasFree() can tell
  * "this pin is already mine" from "this pin is already someone else's".
  * Deliberately a separate parameter from skip_idx - see pinAliasFree(). */
-enum : uint8_t { PINASSIGN_NONE = 0, PINASSIGN_IAC, PINASSIGN_BZ };
+enum : uint8_t { PINASSIGN_NONE = 0, PINASSIGN_IAC, PINASSIGN_BZ,
+                 PINASSIGN_TFTS, PINASSIGN_TFTM, PINASSIGN_TFTC, PINASSIGN_TFTD };
 
 /* True only if s is a complete, non-empty decimal integer (optional leading
  * minus).
@@ -2863,7 +2864,7 @@ static void handleCommand(const String& line) {
             else if (k.length() == 2 && k[0] == 'O') skipIdx = (int)(uint8_t)(k[1] - '1');
             if (skipIdx == -2) {
                 if (!pinAliasFree((uint8_t)pin, -1, PINASSIGN_IAC)) {
-                    Serial.println("pin rejected: already used by another output/IAC/buzzer/LED/speed/gas pin");
+                    Serial.println("pin rejected: already used by another output/IAC/buzzer/LED/speed/gas/display pin");
                     break;
                 }
             } else if (skipIdx >= 0 && skipIdx <= 6) {
@@ -2876,10 +2877,18 @@ static void handleCommand(const String& line) {
                 break;
             } else {
                 /* The TFT SCLK/MOSI/CS/DC and BZ pins must also not collide
-                 * with the actuator pins. */
-                if (!pinAliasFree((uint8_t)pin, -1,
-                                  k == "BZ" ? PINASSIGN_BZ : PINASSIGN_NONE)) {
-                    Serial.println("pin rejected: already used by an output/IAC/buzzer/LED/speed/gas pin");
+                 * with the actuator pins -- and, since 2026-10-01, each of them
+                 * must also not collide with the other three. `assigning` is
+                 * what lets a command keep the pin it already owns; naming the
+                 * wrong field here fails closed (see pinAliasFree()). */
+                uint8_t asg = PINASSIGN_NONE;
+                if      (k == "BZ")   asg = PINASSIGN_BZ;
+                else if (k == "TFTS") asg = PINASSIGN_TFTS;
+                else if (k == "TFTM") asg = PINASSIGN_TFTM;
+                else if (k == "TFTC") asg = PINASSIGN_TFTC;
+                else if (k == "TFTD") asg = PINASSIGN_TFTD;
+                if (!pinAliasFree((uint8_t)pin, -1, asg)) {
+                    Serial.println("pin rejected: already used by an output/IAC/buzzer/LED/speed/gas/display pin");
                     break;
                 }
             }
@@ -3251,8 +3260,9 @@ static bool pinOk(uint8_t p) {
  * stuck on from a plausible typo.
  *
  * This validates the PROPOSED pin against everything it must not collide with.
- * Returns false if p is already used by iac/buzz/ledData/speed/gas, or by any
- * other out[] entry other than out[skip_idx]. */
+ * Returns false if p is already used by iac/buzz/ledData/speed/gas, by any of
+ * the four remappable display pins, or by any other out[] entry other than
+ * out[skip_idx]. */
 /* Which PinMap field the caller is about to overwrite, so pinAliasFree() can
  * tell "this pin is already mine" from "this pin is already someone else's".
  * Deliberately a separate parameter from skip_idx - see pinAliasFree(). */
@@ -3279,6 +3289,45 @@ static bool pinAliasFree(uint8_t p, int skip_idx, uint8_t assigning) {
      * rejected if it collides with the other one. */
     if (p == g_cfg.pin.iac  && assigning != PINASSIGN_IAC) return false;
     if (p == g_cfg.pin.buzz && assigning != PINASSIGN_BZ)  return false;
+    /* The four REMAPPABLE display pins were never checked at all, in either
+     * direction, so two hardware faults were one console command each:
+     *
+     *   P TFTM 18    tftDc is 18 by default. pinOk(18) passes, 18 is not an
+     *                out[], not iac/buzz/ledData/speed and not a GAS_* constant
+     *                -- so MOSI and DC became one wire and both panels decode
+     *                interleaved SPI edges as garbage.
+     *   P TFTC 17 then P O3 17
+     *                tftCs is 17 by default. The second command was accepted,
+     *                so applyPinConfig() ran pinMode(17, OUTPUT) and setOut(3)
+     *                then decided the gas display's chip-select level, while
+     *                every CS edge from the gas renderer hit the relay driver.
+     *
+     * The four hardcoded GAS_* constants below are only HALF the display's pin
+     * set, and adding them alone would still be incomplete: the two renderers
+     * deliberately CROSS their roles (initTft() builds
+     *   Adafruit_GC9A01A(GAS_CS, GAS_DC, tftMosi, tftSclk, -1)
+     * and initGasTft() builds
+     *   Adafruit_GC9A01A(tftCs, tftDc, GAS_MOSI, GAS_SCLK, -1)),
+     * so the idle display also clocks out of tftMosi/tftSclk and the gas
+     * display also clocks out of GAS_MOSI/GAS_SCLK. The full live signal set is
+     *
+     *   idle display : 2, 21, tftMosi, tftSclk
+     *   gas  display : tftCs, tftDc, 16, 15
+     *
+     * i.e. all eight pins, four hardcoded and four remappable, and every one of
+     * the eight now has a check against it here.
+     *
+     * Same shape as the iac/buzz pair: a caller may reuse the pin it already
+     * owns ('P TFTC 17' with tftCs already 17 stays an accepted no-op) but is
+     * refused for the other three. Each check is gated on its OWN enum value, so
+     * a mis-wired or newly added `assigning` value fails CLOSED -- the
+     * self-assignment gets refused, which costs a no-op, and never opens a
+     * collision. A new display pin added to PinMap later must be added here in
+     * the same commit; this is the only place that knows the display's pins. */
+    if (p == g_cfg.pin.tftSclk && assigning != PINASSIGN_TFTS) return false;
+    if (p == g_cfg.pin.tftMosi && assigning != PINASSIGN_TFTM) return false;
+    if (p == g_cfg.pin.tftCs   && assigning != PINASSIGN_TFTC) return false;
+    if (p == g_cfg.pin.tftDc   && assigning != PINASSIGN_TFTD) return false;
     if (p == g_cfg.pin.ledData) return false;
     if (p == PIN_SPEED || p == GAS_SCLK || p == GAS_MOSI || p == GAS_CS || p == GAS_DC) return false;
     for (int i = 0; i < 7; i++) {
