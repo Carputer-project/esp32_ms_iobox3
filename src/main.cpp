@@ -2061,15 +2061,32 @@ static void handleCommand(const String& line) {
     }
 
     switch (key) {
-        case 'F':
+        case 'F': {
+            /* saveCfg() is a ~180-byte g_prefs.putBytes("cfg", ...) - a real
+             * flash write. It used to run unconditionally after the if/else,
+             * so `F` with a bad value printed a rejection and then still
+             * committed the whole config. Repeated by anyone who can reach the
+             * console, that is unbounded flash-write amplification for a
+             * command that changed nothing.
+             *
+             * So gate the write on the config genuinely having moved, not on
+             * the branch having been taken: compare every field this arm can
+             * touch against its previous value, and commit only if one of them
+             * actually changed. `F A` deliberately leaves fanManual alone (A is
+             * "auto", the manual latch is only meaningful once fanAuto is
+             * false), so a redundant `F A` while already in AUTO is a no-op and
+             * must not write either. A rejected value must change nothing and
+             * must not write - so it breaks out before reaching saveCfg(). */
+            bool a0 = g_cfg.fanAuto, m0 = g_cfg.fanManual;
             if (val == "A") { g_cfg.fanAuto = true; }
             else if (val == "1" || val == "0") {
                 g_cfg.fanAuto = false;
                 g_cfg.fanManual = (val == "1");
-            } else Serial.println("fan A|1|0 only (temps fixed)");
-            saveCfg();
+            } else { Serial.println("fan A|1|0 only (temps fixed)"); break; }
+            if (g_cfg.fanAuto != a0 || g_cfg.fanManual != m0) saveCfg();
             break;
-        case 'I':
+        }
+        case 'I': {
             /* Validate the STRING, not the parsed value. String::toInt()
              * returns 0 for anything unparseable and 0 is a LEGAL idle-air
              * duty, so `val.length() > 0` was not a check: `I abc`, `I -5` or
@@ -2082,6 +2099,8 @@ static void handleCommand(const String& line) {
              * typed rubbish"; the range check then rejects out-of-band values
              * instead of silently clamping them. A refused argument changes
              * nothing and prints why. */
+            bool f0 = g_cfg.iacFollow, a0 = g_cfg.iacAuto;
+            uint8_t d0 = g_cfg.iacManualDuty;
             if (val == "F") {
                 g_cfg.iacAuto = false;
                 g_cfg.iacFollow = true;
@@ -2096,9 +2115,17 @@ static void handleCommand(const String& line) {
                 g_cfg.iacManualDuty = (uint8_t)k;
             } else {
                 Serial.println("I F|A|<duty 0-100>");
+                break;
             }
-            saveCfg();
+            /* Write only what moved. All three fields are compared, because a
+             * mode switch carries the other two as a side effect: `I F` sets
+             * iacFollow while clearing iacAuto, so re-sending `I F` while
+             * already following must not commit. Same reason H7 rejected
+             * input with nothing changed applies to accepted input that was
+             * already the requested value: no NVS write for a no-op. */
+            if (g_cfg.iacFollow != f0 || g_cfg.iacAuto != a0 || g_cfg.iacManualDuty != d0) saveCfg();
             break;
+        }
         case 'T': {
             /* Validate the STRING first, for the same reason as `I`. toFloat()
              * also maps unparseable input to 0, and worse it stops at the first
@@ -2131,9 +2158,19 @@ static void handleCommand(const String& line) {
             // updateOutputs(): a saturated 32767 pins the valve +8 above the CLT
             // curve (over-open idle, harder hot restart), a wrapped negative
             // pins it at -5 and starves it.
-            if (t >= 500 && t <= 3000) g_cfg.iacTargetRpm = (int16_t)t;
-            else { Serial.println("T 500-3000 rpm"); break; }
-            saveCfg();
+            if (t < 500 || t > 3000) { Serial.println("T 500-3000 rpm"); break; }
+            /* `T` is on the 0xC0 allow-list, so this arm is reachable by any
+             * unauthenticated sender on the air. saveCfg() is a full
+             * ~180-byte putBytes - one flash write per call - and it used to run
+             * unconditionally, including on the reject path above. A remote peer
+             * looping `T 40000` therefore forced one NVS commit per queued frame
+             * for a command that changed nothing and printed a rejection, and
+             * the 0xD0 ack still reported success. NVS wear on a link that is
+             * not authenticated is the real cost, not the bytes.
+             *
+             * Compare the stored value rather than the parsed one: `T 900` when
+             * 900 is already the target is a no-op and must not write either. */
+            if (g_cfg.iacTargetRpm != (int16_t)t) { g_cfg.iacTargetRpm = (int16_t)t; saveCfg(); }
             break;
         }
         case 'Y': {
