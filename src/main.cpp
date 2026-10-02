@@ -1061,12 +1061,14 @@ static uint32_t s_buzzManualUntilMs = 0;
  *
  * The `!= iac` guard is not optional: on a config where pin.buzz == pin.iac
  * this pad is the idle-air MOSFET gate and must be left to its LEDC PWM. */
-static void buzzReleasePin() {
-    if (g_cfg.pin.buzz == g_cfg.pin.iac) return;
-    pinMode(g_cfg.pin.buzz, OUTPUT);
-    gpio_pullup_en((gpio_num_t)g_cfg.pin.buzz);
-    digitalWrite(g_cfg.pin.buzz, HIGH);   // inverted: HIGH = silent
+static void buzzReleasePad(uint8_t p) {
+    if (p > 39) return;
+    if (p == g_cfg.pin.iac) return;   // that pad belongs to the valve's LEDC
+    pinMode(p, OUTPUT);
+    gpio_pullup_en((gpio_num_t)p);
+    digitalWrite(p, HIGH);             // inverted: HIGH = silent
 }
+static void buzzReleasePin() { buzzReleasePad(g_cfg.pin.buzz); }
 
 static void updateBuzzer() {
     static uint32_t last = 0;
@@ -2793,6 +2795,36 @@ static void handleCommand(const String& line) {
             } else if (k == "TFTD") {
                 g_cfg.pin.tftDc = (uint8_t)pin;
             } else if (k == "BZ") {
+                /* Re-pointing the buzzer pin while an `X 0..3` manual test is
+                 * active used to orphan the pad the test was driving.
+                 *
+                 * `X 3` does pinMode(old); digitalWrite(old, LOW) and sets
+                 * s_buzzManual. `P BZ <new>` then reassigns g_cfg.pin.buzz and
+                 * calls applyPinConfig(), which configures the NEW pad and never
+                 * touches the old one. s_buzzManual was still true, so
+                 * updateBuzzer() early-returned and never drove anything. `X 9`
+                 * and the manual-test timeout both call buzzReleasePin(), which
+                 * releases g_cfg.pin.buzz - by then the NEW pin. So the old pad
+                 * stayed OUTPUT/LOW, the horn kept sounding, and `X 9` printed
+                 * "output restored" while nothing had been restored. Only a power
+                 * cycle cleared it.
+                 *
+                 * That is the exact failure d631cd3 set out to close, reached
+                 * through the one command that re-points the pin. Release the OLD
+                 * pad and drop the manual flag BEFORE the reassignment, so the
+                 * flag is already clear by the time applyPinConfig() runs.
+                 *
+                 * P WIPE already does the s_buzzManual half of this, with the
+                 * comment "applyPinConfig() alone does NOT release it" - the
+                 * pin-remap branch was simply never given the same treatment. */
+                if (g_cfg.pin.buzz != (uint8_t)pin) {
+                    /* buzzReleasePad() re-checks `!= iac` itself, so an
+                     * old config that still has pin.buzz == pin.iac is left
+                     * alone rather than having its valve gate driven. */
+                    buzzReleasePad(g_cfg.pin.buzz);
+                    s_buzzManual = false;
+                    s_buzzManualUntilMs = 0;
+                }
                 g_cfg.pin.buzz = (uint8_t)pin;
             } else {
                 Serial.println("P IAC <pin> | P O<n> <pin> | P TFT 0|1 | P TFTS/TFTM/TFTC/TFTD/BZ <pin> | P DASH/DIAG <mac>|CLEAR | P RESET | P WIPE");
