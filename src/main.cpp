@@ -1346,20 +1346,57 @@ static void gasSampleMv() {
  * Takes the mV explicitly rather than reading s_gasFilt, so it can also re-score
  * an already-recorded mV against a table that has since changed (see
  * gasLogRescore). */
-static int gasPctFromMv(int16_t mv) {
-    // Stuck-at-full poison guard (2026-09-20): a SET F pressed while the
-    // sender was unplugged recorded the ~60k clamp into the FULL anchor, and
-    // every real reading (11.3k-23.5k) is then <= c[0] -> needle pinned at
-    // 100% with SET EMPTY powerless (its check comes after the FULL check).
-    // Detect off-scale / hard-short / zero-span tables and map against the
-    // stock span instead, so the gauge keeps moving until a clean SET F/E.
-    uint16_t c[5];
+/* WHICH TABLE DOES THE NEEDLE ACTUALLY MAP WITH?
+ *
+ * The stuck-at-full poison guard (2026-09-20): a SET F pressed while the sender
+ * was unplugged recorded the ~60k clamp into the FULL anchor, and every real
+ * reading (11.3k-23.5k) is then <= c[0] -> needle pinned at 100% with SET EMPTY
+ * powerless (its check comes after the FULL check). So off-scale / hard-short /
+ * zero-span tables map against the stock span instead, and the gauge keeps
+ * moving until a clean SET F/E.
+ *
+ * The guard lived inline in gasPctFromMv(), which made the mapping table a
+ * secret of one function. gasAutoCal() then ran its slope test straight off
+ * g_cfg.gasCalMv and so read the REJECTED values - a repair path reasoning
+ * about a table the needle is not using. On {F=60000, E=25014} it read
+ * "inverted" (60000 > 25014), so `better` demanded fMv > 60000 and a real
+ * 1009 mV full-tank reading could never move the FULL anchor: the 2026-09-20
+ * failure again, now permanent instead of transient. The EMPTY anchor could
+ * still commit - in the WRONG direction, `better` now being fMv < 25014, so the
+ * first full-tank reading was written into it - and the re-linearisation then
+ * ran the inverted branch and interpolated the mids between 60000 and ~1009,
+ * putting every one of them above the FULL anchor. Simulated end state
+ * {60000, 15756, 30504, 45252, 1009}: still rejected, so still mapping with
+ * stock, and now with the EMPTY anchor destroyed too. Strictly worse than the
+ * state it started in, and reachable by simply driving the tank.
+ *
+ * Single source of truth now. Writes the 5 anchors the gauge really uses into
+ * c[] and returns true if the persisted table was REJECTED (c[] then holds
+ * kGasStockMv). Callers must take their slope direction from c[], never from
+ * g_cfg.gasCalMv. */
+static bool gasCalMapTable(uint16_t c[5]) {
     const uint16_t *src = g_cfg.gasCalMv;
     bool poisoned = (src[0] >= 30000 || src[4] >= 30000 ||   // open-sender clamp
                      src[0] < 1000  || src[4] < 1000  ||     // hard-short reading
                      src[0] == src[4]);                      // zero span
     if (poisoned) src = kGasStockMv;
     for (uint8_t i = 0; i < 5; i++) c[i] = src[i];
+    return poisoned;
+}
+
+/* The per-anchor half of the guard above: is this ONE anchor inside the
+ * sender's live window at all? Deliberately the same 1000/30000 limits, so
+ * gasAutoCal()'s repair escape fires on exactly the tables the guard rejects
+ * and on no others. (auto-cal's own GAS_CAL_VALID_LO is 900, looser on purpose
+ * so the FULL anchor's 50 mV hysteresis band has room at stock 1009; that
+ * looseness belongs to the hysteresis test, not to "is this a tank reading".) */
+static bool gasAnchorSane(int32_t mv) {
+    return mv > 1000 && mv < 30000;
+}
+
+static int gasPctFromMv(int16_t mv) {
+    uint16_t c[5];
+    gasCalMapTable(c);
 
     if (c[0] < c[4]) {   // normal slope: low mV = full, high mV = empty
         if (mv <= c[0]) return 100;
@@ -1529,7 +1566,23 @@ static void gasAutoCal() {
     // not just the manual-anchor case.
     if (s_gasLog.minPct < 0) return;              // log not seeded yet
     bool dirty = false, relin = false;
-    bool inverted = g_cfg.gasCalMv[0] > g_cfg.gasCalMv[4];
+    /* Slope direction MUST come from the table the needle maps with, not from
+     * the persisted one. gasPctFromMv() rejects an off-scale / zero-span table
+     * and substitutes the stock span, so on a rejected table the readings that
+     * armed the >=95% / <=5% gates above were scored against STOCK - and stock
+     * is not inverted (1009 < 25014). Reading the rejected values instead made
+     * `inverted` true on e.g. {F=60000, E=25014}, which demanded fMv > 60000 and
+     * made the FULL anchor un-committable for good: no real reading is ever
+     * above 60000, so no full-tank drive could ever repair it. Same failure
+     * shape as the 2026-09-20 stuck-at-full bug, except the guard now hides it.
+     *
+     * The gates themselves are fine and are deliberately NOT touched: they are
+     * scored against the effective table, so a genuine end-of-scale reading
+     * always arms them whether or not the table is rejected. Only the direction
+     * test was reading the wrong table. */
+    uint16_t cal[5];
+    gasCalMapTable(cal);
+    bool inverted = cal[0] > cal[4];
     // Gate on the EXTREME pct seen, and commit that pct's own mV. Testing only
     // the mV would admit a reading that never reached 95%; testing the LAST
     // crossing instead of the highest would commit whichever sample happened to
@@ -1597,10 +1650,35 @@ static void gasAutoCal() {
         static_assert(GAS_CAL_VALID_LO < (int32_t)kGasStockMv[0] - GAS_CAL_BAND_MV,
                       "GAS_CAL_VALID_LO leaves no room for the FULL anchor's band; "
                       "the anchor would become un-committable (the 2f086c1 bug)");
-        if (better && clears) {
+        /* A repair path that is gated on the broken value cannot repair it.
+         *
+         * The band is measured FROM the anchor, so an anchor that is itself
+         * off-scale puts the acceptable window where no real reading can reach
+         * it: {F=500} (hard-short record) has a band at 450 and only a
+         * reading below 450 would clear it, but gasLogUpdate's plausibility
+         * gate already refuses anything under 1000. The anchor is then stuck at
+         * a value gasCalMapTable() rejects, so the table stays discarded and the
+         * gauge runs on the stock span forever - there is no other writer, since
+         * the manual `Q F` path rejects the same off-scale values.
+         *
+         * The band exists to stop a jittery sample ratcheting a HEALTHY anchor,
+         * so it must not apply to an anchor that is not a tank reading. Any
+         * in-window reading replaces an off-scale one. This is not a licence to
+         * overwrite a good anchor: gasAnchorSane() uses the guard's own 1000 /
+         * 30000 limits, so on a table gasCalMapTable() accepts this term is
+         * always false and the committed behaviour is bit-for-bit the old one.
+         *
+         * What gets written is still gated: it must be inside the valid window
+         * and must have scored >=95% against the effective table, which on a
+         * rejected table means the stock span - i.e. a genuine full-tank
+         * voltage. The escape cannot write noise, only the end of the scale that
+         * the whole auto-cal feature exists to capture. */
+        bool fBroken = !gasAnchorSane(fOld);
+        if (fBroken || (better && clears)) {
             g_cfg.gasCalMv[0] = (uint16_t)fMv;                       // FULL anchor
             dirty = relin = true;
-            Serial.printf("gas auto-cal: F set = %u mv\n", g_cfg.gasCalMv[0]);
+            Serial.printf("gas auto-cal: F set = %u mv%s\n", g_cfg.gasCalMv[0],
+                          fBroken ? " (replacing off-scale FULL anchor)" : "");
         }
     }
     int32_t eOld = g_cfg.gasCalMv[4];
@@ -1608,10 +1686,12 @@ static void gasAutoCal() {
         int32_t band  = inverted ? eOld - GAS_CAL_BAND_MV : eOld + GAS_CAL_BAND_MV;
         bool better   = inverted ? (eMv < eOld) : (eMv > eOld);
         bool clears   = inverted ? (eMv <= band) : (eMv >= band);
-        if (better && clears) {
+        bool eBroken = !gasAnchorSane(eOld);  // same escape as FULL, see above
+        if (eBroken || (better && clears)) {
             g_cfg.gasCalMv[4] = (uint16_t)eMv;                       // EMPTY anchor
             dirty = relin = true;
-            Serial.printf("gas auto-cal: E set = %u mv\n", g_cfg.gasCalMv[4]);
+            Serial.printf("gas auto-cal: E set = %u mv%s\n", g_cfg.gasCalMv[4],
+                          eBroken ? " (replacing off-scale EMPTY anchor)" : "");
         }
     }
     if (relin && g_cfg.gasCalMv[0] < g_cfg.gasCalMv[4]) {
