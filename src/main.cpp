@@ -1829,6 +1829,17 @@ static constexpr float GAS_RIN  = 92.0f;   // tick inner radius
 static constexpr float GAS_ROUT = 108.0f;  // tick outer radius
 static constexpr float GAS_NEEDLE_R = 118.0f;
 static constexpr float GAS_NEEDLE_W = 6.0f; // needle base half-width at pivot
+/* Half-width of the wedge of the ring that the needle's black triangle can
+ * reach, in degrees.
+ *
+ * drawGasNeedle() puts the base corners GAS_NEEDLE_W px either side of the pivot
+ * and the apex at GAS_NEEDLE_R, so the triangle subtends a half-angle of
+ * atan(GAS_NEEDLE_W / r) at radius r - largest at the INNER edge of the ring,
+ * r=86, which is 3.99 deg. The apex coordinate is truncated to int16_t, worth up
+ * to about 0.7 deg more. 6.0 is the next whole scale-tick step above that, so
+ * the restore wedge cannot under-run the erase and does not reach any further
+ * into the ring than the erase could have. */
+static constexpr float GAS_NEEDLE_WEDGE_DEG = 6.0f;
 
 static float gasAngleDeg(int pct) {
     return GAS_A0 + (GAS_A1 - GAS_A0) * pct / 100.0f;
@@ -1930,12 +1941,53 @@ static void drawGasMarks() {
     }
 }
 
+/* Repaint the tick ring between two angles, in the one z-order it has.
+ *
+ * Three layers, bottom to top: the 6 deg scale ticks, the white 25/50/75
+ * majors, the yellow float-history band. Everything that erases ring pixels has
+ * to put them back through THIS function and nothing else, or they do not come
+ * back: the ring is a delta-tracked region and nothing redraws it wholesale
+ * except drawGasFrame()'s fillScreen().
+ *
+ * `bandLoPct`/`bandHiPct` are the band to DRAW, not the band being erased. A
+ * caller whose band is changing passes the union of the old and new band as the
+ * angular range and only the NEW band as these, so the part of the band that is
+ * departing gets the scale and the majors repainted over it. Pass bandLoPct < 0
+ * to draw no band at all.
+ *
+ * Clamped to the arc: the needle wedge at either end of the scale overhangs it
+ * by 6 deg, and a phantom tick outside the arc would be plainly visible. */
+static void drawGasRing(float fromDeg, float toDeg, int bandLoPct, int bandHiPct) {
+    if (fromDeg < GAS_A0) fromDeg = GAS_A0;
+    if (toDeg   > GAS_A1) toDeg   = GAS_A1;
+    if (toDeg < fromDeg) return;
+    // Scale ticks: the 6 deg grid, starting at the first whole step at or after
+    // fromDeg. (A tick drawn a fraction of a degree outside the wedge would be
+    // harmless - same colour, already there - but not worth relying on.)
+    int a0 = gasRound6(fromDeg);
+    if ((float)a0 < fromDeg) a0 += 6;
+    for (int a = a0; a <= toDeg; a += 6) drawGasTick((float)a, GC9A01A_DARKGREY);
+    for (int p = 0; p <= 100; p += 25) {
+        float d = gasAngleDeg(p);
+        if (d >= fromDeg && d <= toDeg) drawGasMajorTick(d);
+    }
+    // The band walks its own grid: a step of 2% is 4.8 deg, deliberately not a
+    // multiple of the 6 deg scale step, so gasRound6() must NOT be used to place
+    // it. That mismatch is what the old needle-erase repaint got wrong - it
+    // restored the scale on the 6 deg grid and the band was left with a hole.
+    if (bandLoPct >= 0) {
+        for (int p = bandLoPct; p <= bandHiPct; p += 2) {
+            float d = gasAngleDeg(p);
+            if (d >= fromDeg && d <= toDeg) drawGasTick(d, GC9A01A_YELLOW);
+        }
+    }
+}
+
 static void drawGasFrame() {
     s_gasTft->fillScreen(GC9A01A_BLACK);
     s_gasTft->drawCircle(GAS_CX, GAS_CY, 119, GC9A01A_NAVY);
     s_gasTft->drawCircle(GAS_CX, GAS_CY, 118, GC9A01A_DARKGREY);
-    for (int a = (int)GAS_A0; a <= (int)GAS_A1; a += 6) drawGasTick((float)a, GC9A01A_DARKGREY);
-    for (int p = 0; p <= 100; p += 25) drawGasMajorTick((float)gasAngleDeg(p));
+    drawGasRing(GAS_A0, GAS_A1, s_gasLog.minPct, s_gasLog.maxPct);
     drawGasMarks();
     s_gasTft->setTextColor(GC9A01A_LIGHTGREY);
     s_gasTft->setTextSize(1);
@@ -1954,16 +2006,22 @@ static void drawGasFrame() {
     s_lastGasLoMv[0] = s_lastGasHiMv[0] = 0;
     s_lastGasCal[0] = 0;
     s_lastPctColor = s_lastLowColor = 0xFFFF;
-    // The float-history band is static-delta-tracked, so it MUST be invalidated
-    // here or it is lost for the life of the frame. It used to be a
-    // function-local static inside updateGasDisplay(): that survived the
-    // fillScreen() above, so after ANY re-init drawGasFrame() wiped the yellow
-    // band off the panel while the delta tracker still believed it was drawn —
-    // the band then never came back until the float's lifetime min or max
-    // happened to change. Worse, the "erase the previous band" loop would then
-    // scribble dark ticks over a region that had just been filled, for a band
-    // that no longer existed.
-    s_bandMin = s_bandMax = -2;
+    // The float-history band is delta-tracked, and the delta tracker must
+    // describe the PANEL, not the intention - so it is set to the band
+    // drawGasRing() just drew rather than invalidated. Invalidating it to -2 used
+    // to be the only option, because drawGasFrame() drew no band at all and the
+    // band could only be painted from updateGasDisplay(); now the frame composites
+    // it with the rest of the ring, so the tracker and the pixels agree
+    // immediately and the band does not blink out for one pass after a re-init.
+    //
+    // It is still file scope, not a local of updateGasDisplay(). A function-local
+    // static survived the fillScreen() above while the pixels did not, so after
+    // ANY re-init the tracker believed the band was drawn when the panel was
+    // bare: the band stayed gone until the float's lifetime min or max happened to
+    // change, and the "erase the previous band" loop then scribbled dark ticks
+    // over a region that had just been filled, for a band that no longer existed.
+    s_bandMin = s_gasLog.minPct;
+    s_bandMax = s_gasLog.maxPct;
 }
 
 static void updateGasDisplay() {
@@ -1989,8 +2047,23 @@ static void updateGasDisplay() {
 
     if (s_needleDrawn && (moved || blinkChange || lowChange)) {
         drawGasNeedle(s_needleDeg, GC9A01A_BLACK);          // erase old needle
-        drawGasTick((float)gasRound6(s_needleDeg), GC9A01A_DARKGREY);  // patch the scale
-        for (int p = 0; p <= 100; p += 25) drawGasMajorTick((float)gasAngleDeg(p));
+        /* Put the ring back the way drawGasRing() lays it out, over exactly the
+         * wedge the black triangle can reach and no further.
+         *
+         * This used to restore ONE scale tick, placed with gasRound6(), and then
+         * repaint all five majors. That is the M13 defect: the band walks a 4.8
+         * deg grid (gasAngleDeg(2%) == 150 + 2.4*2) and the scale a 6 deg one, so
+         * the two coincide only at every fifth band tick. The triangle wipes
+         * +-4 deg, most of the band hairlines inside that arc were therefore
+         * destroyed and never repainted, and the band block below only redraws on
+         * a change of bMin/bMax - i.e. on the next new lifetime extreme, after the
+         * next fill. A single drain across the band annihilated it.
+         *
+         * drawGasMarks() is still needed separately: the 1/4 / 1/2 / 3/4 labels
+         * sit at r=70, inside the ring, so the triangle reaches them too. */
+        drawGasRing(s_needleDeg - GAS_NEEDLE_WEDGE_DEG,
+                    s_needleDeg + GAS_NEEDLE_WEDGE_DEG,
+                    s_gasLog.minPct, s_gasLog.maxPct);
         drawGasMarks();
         // The black triangle runs out to r=118, so it clips the CAL indicator
         // too. Its delta tracker would otherwise still read "up to date" and the
@@ -1999,6 +2072,36 @@ static void updateGasDisplay() {
         // a pass that already repaints three labels above.
         s_lastGasCal[0] = 0;
     }
+
+    /* Min/Max tank-float log: a yellow band on the tick ring tracing the sweep
+     * the float has covered (from LO% up to HI%). The needle already shows the
+     * live level, so the band reads instantly with no text.
+     *
+     * Recomposites the UNION of the old and new band, with the NEW band as the
+     * band to draw. The old code painted the departing band in DARKGREY and
+     * nothing else, which destroyed the scale ticks and the white majors under it
+     * and restored neither - so a band that shrank also ate the 1/2 mark, and a
+     * band that grew left a clean gap.
+     *
+     * Placed BEFORE the needle draw so the needle is always the top layer. It used
+     * to run last, which meant a band change could paint over the live needle
+     * without restoring it; moving it here removes that, and the ring is
+     * otherwise untouched by the needle because the needle is drawn afterwards. */
+    int16_t bMin = s_gasLog.minPct, bMax = s_gasLog.maxPct;
+    if (bMin != s_bandMin || bMax != s_bandMax) {
+        // bMin < 0 means there is no band at all now (unseeded log), so the whole
+        // arc has to be restored rather than just the old band's span.
+        int16_t lo = bMin >= 0 ? bMin : 0;
+        int16_t hi = bMin >= 0 ? bMax : 100;
+        if (s_bandMin >= 0) {
+            if (lo > s_bandMin) lo = s_bandMin;
+            if (hi < s_bandMax) hi = s_bandMax;
+        }
+        drawGasRing(gasAngleDeg(lo), gasAngleDeg(hi), bMin, bMax);
+        s_bandMin = bMin;
+        s_bandMax = bMax;
+    }
+
     if (blinkChange || lowChange) {
         uint16_t alarmColor = phase ? GC9A01A_RED : GC9A01A_DARKGREY;
         s_gasTft->drawCircle(GAS_CX, GAS_CY, 118, low ? alarmColor : GC9A01A_DARKGREY);
@@ -2042,22 +2145,6 @@ static void updateGasDisplay() {
     drawGasText(40, 196, 1, 34, GC9A01A_DARKGREY, s_lastGasCal, nullptr,
                 gasMidsAreExplicit() ? "CAL*" : "CAL");
 
-    // Min/Max tank-float log: a yellow band on the tick ring tracing the
-    // sweep the float has covered (from LO% up to HI%). The needle already
-    // shows the live level, so the band reads instantly with no text.
-    int16_t bMin = s_gasLog.minPct, bMax = s_gasLog.maxPct;
-    if (bMin != s_bandMin || bMax != s_bandMax) {
-        if (s_bandMin >= 0) {            // erase previous band
-            for (int a = s_bandMin; a <= s_bandMax; a += 2)
-                drawGasTick(gasAngleDeg(a), GC9A01A_DARKGREY);
-        }
-        if (bMin >= 0) {                 // draw new band
-            for (int a = bMin; a <= bMax; a += 2)
-                drawGasTick(gasAngleDeg(a), GC9A01A_YELLOW);
-        }
-        s_bandMin = bMin;
-        s_bandMax = bMax;
-    }
 }
 
 static void initGasTft() {
