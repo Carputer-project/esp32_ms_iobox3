@@ -2505,10 +2505,28 @@ static void handleCommand(const String& line) {
                 tArg.trim();
                 float v = argIsFloat(tArg) ? tArg.toFloat() : -1.0f;
                 if (o <= 6 && v >= 0.1f && v <= 15.0f) {
+                    /* Polarity: these two forms carry none, so they reset it to
+                     * active-HIGH, exactly as the plain form does. They used to
+                     * touch neither s_anLow[n] nor saveAnPol(), so `A3 L2` then
+                     * `A3 F` left s_anLow[2] == true and updateAnalogLatch()
+                     * evaluated the channel with the GND-switched branch
+                     * `raw = latched ? (mv < t + 150) : (mv <= t)`. On the A3
+                     * high-beam tap, which idles at ~12V through the lamp
+                     * filament, mv never approaches t + 150, so the channel
+                     * NEVER latched and the output it was mapped to never
+                     * activated - with the console showing a successful map.
+                     * The stale bit also survived reboot, because saveAnPol()
+                     * was never called with the reset. */
+                    bool wasLow = s_anLow[n];
                     g_cfg.anOut[n] = o + 1;
                     g_cfg.anEnable[n] = true;
                     g_cfg.anThresh[n] = (uint16_t)(v * 1000.0f);
-                    Serial.printf("a%u %s thr=%.1fV\n", n + 1, tgtName(o + 1), v);
+                    s_anLow[n] = false;
+                    saveAnPol();
+                    Serial.printf("a%u %s thr=%.1fV %s\n", n + 1, tgtName(o + 1), v,
+                                  s_anLow[n] ? "LOW(gnd)" : "HIGH(12V)");
+                    if (wasLow) Serial.printf("a%u polarity was LOW(gnd), reset to HIGH(12V): "
+                                               "an idling-12V wire will now latch ON, use A%uL<v> for gnd-switched\n", n + 1, n + 1);
                 } else {
                     accept = false;
                     Serial.printf("A%u O<k> <v>, k=1..7 v=0.1-15.0V (got \"%s\")\n", n + 1, m.c_str());
@@ -2520,10 +2538,16 @@ static void handleCommand(const String& line) {
                 tArg.trim();
                 float v = argIsFloat(tArg) ? tArg.toFloat() : -1.0f;
                 if (v >= 0.1f && v <= 15.0f) {
+                    bool wasLow = s_anLow[n];
                     g_cfg.anOut[n] = 7;
                     g_cfg.anEnable[n] = true;
                     g_cfg.anThresh[n] = (uint16_t)(v * 1000.0f);
-                    Serial.printf("a%u %s thr=%.1fV\n", n + 1, tgtName(7), v);
+                    s_anLow[n] = false;   // F carries no polarity: same reset as O
+                    saveAnPol();
+                    Serial.printf("a%u %s thr=%.1fV %s\n", n + 1, tgtName(7), v,
+                                  s_anLow[n] ? "LOW(gnd)" : "HIGH(12V)");
+                    if (wasLow) Serial.printf("a%u polarity was LOW(gnd), reset to HIGH(12V): "
+                                               "an idling-12V wire will now latch ON, use A%uL<v> for gnd-switched\n", n + 1, n + 1);
                 } else {
                     accept = false;
                     Serial.printf("A%u F <v>, v=0.1-15.0V (got \"%s\")\n", n + 1, m.c_str());
