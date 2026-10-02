@@ -1469,7 +1469,31 @@ static void gasAutoCal() {
      * away samples that were not convincingly at the end of the scale, so a
      * small step in the right direction is safe. */
     constexpr int32_t GAS_CAL_BAND_MV  = 50;
-    constexpr int32_t GAS_CAL_VALID_LO = 1000;
+    /* 900, not 1000, and that is load-bearing.
+     *
+     * The first version of this fix kept the floor at 1000 and, because the
+     * stock FULL anchor is 1009, the 50 mV band needed 959 - which is outside
+     * the valid range, so the band was switched OFF for exactly the case the
+     * fix exists for and the anchor became un-committable. The obvious repair
+     * was to accept "valid and strictly better" when the band did not fit, and
+     * that is what 2f086c1 shipped.
+     *
+     * It does ratchet. A single 1 mV dip satisfies "strictly better", so the
+     * anchor walks 1009 -> 1001 in eight commits and then stops at the floor,
+     * after which a genuinely full tank reads 99% instead of 100%. Observed on
+     * the bench: pts[F,...] = 1001 where stock is 1009. The >=95% gate does not
+     * prevent it - that gate is about the tank being full, not about the
+     * reading being steady.
+     *
+     * So the band stays ON, and the floor moves instead. 900 leaves 959 inside
+     * the range, so a jitter dip no longer commits and a real 50 mV+ improvement
+     * does. The EMPTY side was never affected (band 25064 < 30000), which is
+     * why the relaxation was asymmetric and asymmetric in the direction that
+     * degrades the reading. With this floor both directions enforce the band.
+     *
+     * 900 is also consistent with the manual `Q F`/`Q E` rejection, which
+     * refuses raw < 1000 as an off-scale short. */
+    constexpr int32_t GAS_CAL_VALID_LO = 900;
     constexpr int32_t GAS_CAL_VALID_HI = 30000;
 
     int32_t fOld = g_cfg.gasCalMv[0];
@@ -1478,7 +1502,14 @@ static void gasAutoCal() {
         bool bandFits = inverted ? (band < GAS_CAL_VALID_HI) : (band > GAS_CAL_VALID_LO);
         bool better   = inverted ? (fMv > fOld) : (fMv < fOld);
         bool clears   = inverted ? (fMv >= band) : (fMv <= band);
-        if (better && (clears || !bandFits)) {
+        /* bandFits is asserted, not tested. If the floor is ever raised past
+         * stockFull-50 the FULL anchor silently becomes un-committable again -
+         * which is the original bug - so make it a build-time failure rather
+         * than a field report. kGasStockMv[0] is 1009. */
+        static_assert(GAS_CAL_VALID_LO < (int32_t)kGasStockMv[0] - GAS_CAL_BAND_MV,
+                      "GAS_CAL_VALID_LO leaves no room for the FULL anchor's band; "
+                      "the anchor would become un-committable (the 2f086c1 bug)");
+        if (better && clears) {
             g_cfg.gasCalMv[0] = (uint16_t)fMv;                       // FULL anchor
             dirty = relin = true;
             Serial.printf("gas auto-cal: F set = %u mv\n", g_cfg.gasCalMv[0]);
@@ -1487,10 +1518,9 @@ static void gasAutoCal() {
     int32_t eOld = g_cfg.gasCalMv[4];
     if (eMv > GAS_CAL_VALID_LO && eMv < GAS_CAL_VALID_HI && eMv != eOld) {
         int32_t band  = inverted ? eOld - GAS_CAL_BAND_MV : eOld + GAS_CAL_BAND_MV;
-        bool bandFits = inverted ? (band > GAS_CAL_VALID_LO) : (band < GAS_CAL_VALID_HI);
         bool better   = inverted ? (eMv < eOld) : (eMv > eOld);
         bool clears   = inverted ? (eMv <= band) : (eMv >= band);
-        if (better && (clears || !bandFits)) {
+        if (better && clears) {
             g_cfg.gasCalMv[4] = (uint16_t)eMv;                       // EMPTY anchor
             dirty = relin = true;
             Serial.printf("gas auto-cal: E set = %u mv\n", g_cfg.gasCalMv[4]);
