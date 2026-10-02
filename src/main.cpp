@@ -2687,35 +2687,146 @@ static void handleCommand(const String& line) {
             String p1 = a > 0 ? v.substring(0, a) : v;
             String p2 = a > 0 ? v.substring(a + 1) : "";
             p2.trim();
+
+            /* H6 - every numeric argument is validated as a STRING before it is
+             * parsed, and no field is written until every argument of the
+             * sub-command has passed.
+             *
+             * String::toFloat() is atof() and String::toInt() is atol(). atof
+             * accepts "nan", "inf" and a leading numeric prefix of anything
+             * ("212abc" -> 212.0); atol returns 0 for anything that is not a
+             * number at all. So a malformed argument used to reach g_cfg as a
+             * silently clamped, saveCfg()-persisted threshold instead of a
+             * refusal. Every one of these fields is then compared against a
+             * LIVE sensor reading in engineWarnFlags(), and a threshold that
+             * landed at the wrong end of its range does not just read wrong, it
+             * latches. Taking this car's real readings (g_* all in tenths) and
+             * running the stored threshold back through engineWarnFlags():
+             *
+             *   W clt nan      -> 100.0 F. cltOk holds (107-126 F is in range),
+             *                     so 107 > 100 => W_OVERHEAT, CONTINUOUSLY:
+             *                     buzzer every second, warn relay blinking,
+             *                     and saveCfg() makes it survive a power cycle.
+             *   W mat nan      ->  50.0 F => 107 >  50 => W_HOTAIR, continuously.
+             *   W map nan      ->   0.0 kPa. This check has no sanity gate at
+             *                     all (no mapOk), so 98 > 0 => W_OVERBOOST,
+             *                     continuously.
+             *   W batt nan nan ->   5.0 V, which is UNDER a resting battery, so
+             *                     it is an OVER-voltage reading: 126 > 50 =>
+             *                     W_HIBATT, continuously.
+             *   W afr nan nan  ->   5.0 AFR => 130 > 50 => W_LEAN, continuously.
+             *   W maxrpm junk  -> atol's 0 clamped to 1000 rpm => 4200 >= 1000
+             *                     => W_OVERREV at cruise.
+             *   W idle junk junk -> 300/300 rpm => 900 > 300 with TPS under 20%
+             *                     => W_IDLE_HI at cruise, and W_IDLE_LO becomes
+             *                     unreachable.
+             *   W warnout junk -> 0, and the lamp is gated on warnOut >= 1, so
+             *                     the check-engine output silently dies.
+             *   W hold junk    -> 0, silently killing the latch hold.
+             *
+             * So NONE of these nine is safe by accident: five fail through
+             * atof's NaN and four through atol's 0, and they were all fixed
+             * the same way rather than leaving the integer ones because they
+             * looked lower-risk.
+             *
+             * "inf" is rejected as well, deliberately. (int) of it is undefined
+             * behaviour too; on Xtensa it happens to land on the range maximum
+             * so it was harmless in practice, but that is luck rather than
+             * intent and one rule is easier to keep right than two.
+             *
+             * The string test cannot be replaced by a test on the parsed
+             * result. A result check cannot tell "the operator typed 0" from
+             * "the operator typed rubbish", and a NaN result is not
+             * distinguishable from a real reading at all. isfinite() on the
+             * result is kept as well, because the grammar below still admits an
+             * arbitrarily long digit run and atof() of that is +inf. */
+            auto argIsNum = [](const String& s) -> bool {
+                if (s.length() == 0) return false;
+                bool digit = false, dot = false;
+                for (unsigned i = 0; i < s.length(); i++) {
+                    char c = s[i];
+                    if ((c == '-' || c == '+') && i == 0) continue;   /* sign, position 0 only */
+                    if (c == '.') {
+                        if (dot) return false;
+                        dot = true;
+                    } else if (c < '0' || c > '9') {
+                        return false;   /* letters, "nan", "inf", whitespace */
+                    } else {
+                        digit = true;
+                    }
+                }
+                return digit;           /* rejects "", "+", "-", "." */
+            };
+            /* Same arithmetic as the pre-H6 expression (toFloat() * 10.0f, then
+             * truncate toward zero, then constrain), but the clamp happens in
+             * float BEFORE the int cast. That cast was the undefined step:
+             * atof can hand back a finite float far outside any of these
+             * ranges, and (int) of that is UB on Xtensa. Once clamped, t is
+             * inside [lo,hi] and the cast is defined. */
+            auto num10 = [&argIsNum](const String& s, int lo, int hi, int& out) -> bool {
+                if (!argIsNum(s)) return false;
+                float f = s.toFloat();
+                if (!isfinite(f)) return false;
+                float t = f * 10.0f;
+                if (t < (float)lo) t = (float)lo;
+                if (t > (float)hi) t = (float)hi;
+                out = (int)t;
+                return true;
+            };
+            /* A refusal must be VISIBLE and INERT. Every reject below breaks
+             * out of this case, which skips both the field assignments and the
+             * saveCfg() at the bottom, so a refused argument leaves the running
+             * profile and the stored profile exactly as they were. */
+            auto reject = [](const String& key, const String& arg) {
+                Serial.print("W ");
+                Serial.print(key);
+                Serial.print(": '");
+                Serial.print(arg);
+                Serial.println("' is not a number - eng profile unchanged");
+            };
+
             if (k == "idle" && a > 0) {
+                if (!argIsInt(p1)) { reject(k, p1); break; }
+                if (!argIsInt(p2)) { reject(k, p2); break; }
                 int mn = constrain(p1.toInt(), 300, 3000);
                 int mx = constrain(p2.toInt(), 300, 3000);
                 if (mx < mn) { int t = mn; mn = mx; mx = t; }
                 g_cfg.eng.idleRpmMin = (int16_t)mn;
                 g_cfg.eng.idleRpmMax = (int16_t)mx;
             } else if (k == "maxrpm" && p1.length() > 0) {
+                if (!argIsInt(p1)) { reject(k, p1); break; }
                 g_cfg.eng.maxRpm = (int16_t)constrain(p1.toInt(), 1000, 20000);
             } else if (k == "clt" && p1.length() > 0) {
-                g_cfg.eng.cltMax = (int16_t)constrain((int)(p1.toFloat() * 10.0f), 1000, 3000);
+                int t;
+                if (!num10(p1, 1000, 3000, t)) { reject(k, p1); break; }
+                g_cfg.eng.cltMax = (int16_t)t;
             } else if (k == "mat" && p1.length() > 0) {
-                g_cfg.eng.matMax = (int16_t)constrain((int)(p1.toFloat() * 10.0f), 500, 2500);
+                int t;
+                if (!num10(p1, 500, 2500, t)) { reject(k, p1); break; }
+                g_cfg.eng.matMax = (int16_t)t;
             } else if (k == "batt" && a > 0) {
-                int mn = constrain((int)(p1.toFloat() * 10.0f), 50, 200);
-                int mx = constrain((int)(p2.toFloat() * 10.0f), 50, 200);
+                int mn, mx;
+                if (!num10(p1, 50, 200, mn)) { reject(k, p1); break; }
+                if (!num10(p2, 50, 200, mx)) { reject(k, p2); break; }
                 if (mx < mn) { int t = mn; mn = mx; mx = t; }
                 g_cfg.eng.battMin = (int16_t)mn;
                 g_cfg.eng.battMax = (int16_t)mx;
             } else if (k == "map" && p1.length() > 0) {
-                g_cfg.eng.mapMax = (int16_t)constrain((int)(p1.toFloat() * 10.0f), 0, 4000);
+                int t;
+                if (!num10(p1, 0, 4000, t)) { reject(k, p1); break; }
+                g_cfg.eng.mapMax = (int16_t)t;
             } else if (k == "afr" && a > 0) {
-                int lo = constrain((int)(p1.toFloat() * 10.0f), 50, 250);
-                int hi = constrain((int)(p2.toFloat() * 10.0f), 50, 250);
+                int lo, hi;
+                if (!num10(p1, 50, 250, lo)) { reject(k, p1); break; }
+                if (!num10(p2, 50, 250, hi)) { reject(k, p2); break; }
                 if (hi < lo) { int t = lo; lo = hi; hi = t; }
                 g_cfg.eng.afrLow = (int16_t)lo;
                 g_cfg.eng.afrHigh = (int16_t)hi;
             } else if (k == "hold" && p1.length() > 0) {
+                if (!argIsInt(p1)) { reject(k, p1); break; }
                 g_cfg.eng.warnHoldMs = (uint16_t)constrain(p1.toInt(), 0, 60000);
             } else if (k == "warnout" && p1.length() > 0) {
+                if (!argIsInt(p1)) { reject(k, p1); break; }
                 g_cfg.eng.warnOut = (uint8_t)constrain(p1.toInt(), 0, 7);
             } else if (k == "help") {
                 Serial.println("W[0|1] | W idle <min> <max> | W maxrpm <rpm> | W clt <F> | W mat <F> | W batt <min> <max> | W map <kPa> | W afr <min> <max> | W hold <ms> | W warnout <0-7>");
