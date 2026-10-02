@@ -2949,14 +2949,23 @@ void loop() {
                 // reply forever. GPIO3 also floats when no USB host is
                 // attached and picks up harness noise as random bytes — those
                 // junk lines used to trigger "?)" hints / beep / help spam.
-                // Discard lines with non-printables; answer clean ones with a
-                // prompt so any probe always gets an immediate ack.
+                // Discard lines with non-printables and over-long lines; answer
+                // clean ones with a prompt so any probe always gets an ack.
                 if (!badLine && line.length()) { handleCommand(line); Serial.print("> "); }
                 line = "";
                 badLine = false;
             } else {
+                // badLine is a latch: only the terminator above clears it, so
+                // once a line is flagged, none of its remaining bytes can run.
                 if (ch < 32 || ch > 126) badLine = true;   // non-printable = noise
-                else if (line.length() >= 128) { line = ""; badLine = false; line += ch; }  // junk flood: drop the flood, keep the char that overflowed it
+                // Over-long line: empty the buffer AND leave it flagged. Emptying
+                // the buffer alone used to clear the flag too, so the 129th byte
+                // started a fresh line and the whole SUFFIX after it was handed
+                // to handleCommand() on the next \n -- e.g. 128 printable bytes,
+                // then "W 0", then \n, ran "W 0" and disarmed the warning system.
+                // Discarding the prefix but keeping the suffix is not "dropping
+                // the flood", so this flags the line bad and keeps it bad.
+                else if (line.length() >= 128) { line = ""; badLine = true; }
                 else line += ch;
             }
         }
