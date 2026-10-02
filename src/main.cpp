@@ -1943,11 +1943,21 @@ static void drawGasMarks() {
 
 /* Repaint the tick ring between two angles, in the one z-order it has.
  *
- * Three layers, bottom to top: the 6 deg scale ticks, the white 25/50/75
- * majors, the yellow float-history band. Everything that erases ring pixels has
- * to put them back through THIS function and nothing else, or they do not come
- * back: the ring is a delta-tracked region and nothing redraws it wholesale
- * except drawGasFrame()'s fillScreen().
+ * Three layers, bottom to top: the 6 deg scale ticks, the yellow float-history
+ * band, the white 25/50/75 majors. Everything that erases ring pixels has to put
+ * them back through THIS function and nothing else, or they do not come back: the
+ * ring is a delta-tracked region and nothing redraws it wholesale except
+ * drawGasFrame()'s fillScreen().
+ *
+ * The majors are ABOVE the band, deliberately. drawGasMajorTick spans r=86..110
+ * and the band r=92..108, so they overlap from 92 to 108, and the band used to be
+ * drawn last - it won there, and the 1/2 mark survived only as two 6 px stubs
+ * above and below the yellow. It never healed, because the majors were repainted
+ * before the band on every pass. The majors are the reference the band is read
+ * against, so they have to be legible through it; the band is a translucent-looking
+ * overlay in the reader's eye, and losing the reference mark to show more of the
+ * overlay is the wrong trade. The band still covers the ordinary scale ticks,
+ * which is correct - they are texture, not reference.
  *
  * `bandLoPct`/`bandHiPct` are the band to DRAW, not the band being erased. A
  * caller whose band is changing passes the union of the old and new band as the
@@ -1967,19 +1977,20 @@ static void drawGasRing(float fromDeg, float toDeg, int bandLoPct, int bandHiPct
     int a0 = gasRound6(fromDeg);
     if ((float)a0 < fromDeg) a0 += 6;
     for (int a = a0; a <= toDeg; a += 6) drawGasTick((float)a, GC9A01A_DARKGREY);
-    for (int p = 0; p <= 100; p += 25) {
-        float d = gasAngleDeg(p);
-        if (d >= fromDeg && d <= toDeg) drawGasMajorTick(d);
-    }
     // The band walks its own grid: a step of 2% is 4.8 deg, deliberately not a
     // multiple of the 6 deg scale step, so gasRound6() must NOT be used to place
-    // it. That mismatch is what the old needle-erase repaint got wrong - it
-    // restored the scale on the 6 deg grid and the band was left with a hole.
+    // it. That mismatch is what the needle-erase repaint used to get wrong - it
+    // restored the scale on the 6 deg grid and left the band with a hole.
     if (bandLoPct >= 0) {
         for (int p = bandLoPct; p <= bandHiPct; p += 2) {
             float d = gasAngleDeg(p);
             if (d >= fromDeg && d <= toDeg) drawGasTick(d, GC9A01A_YELLOW);
         }
+    }
+    // Majors last, so they read through the band. See the note above.
+    for (int p = 0; p <= 100; p += 25) {
+        float d = gasAngleDeg(p);
+        if (d >= fromDeg && d <= toDeg) drawGasMajorTick(d);
     }
 }
 
@@ -2079,9 +2090,11 @@ static void updateGasDisplay() {
      *
      * Recomposites the UNION of the old and new band, with the NEW band as the
      * band to draw. The old code painted the departing band in DARKGREY and
-     * nothing else, which destroyed the scale ticks and the white majors under it
-     * and restored neither - so a band that shrank also ate the 1/2 mark, and a
-     * band that grew left a clean gap.
+     * nothing else, so any white major the band crossed was turned dark grey and
+     * never repainted, and the vacated part of the ring lost the scale ticks that
+     * were under it. Both happen whether the band grew or shrank: on a grow the
+     * vacated pixels get re-yellowed as part of the new band, so only the major
+     * is left wrong, and on a shrink they are left dark grey.
      *
      * Placed BEFORE the needle draw so the needle is always the top layer. It used
      * to run last, which meant a band change could paint over the live needle
