@@ -1144,6 +1144,10 @@ static char s_lastClt[8] = "";
 static char s_lastMode[8] = "";
 static char s_lastStat[24] = "";
 static char s_lastWarn[12] = "";
+/* Blink phase the warning text on screen was last drawn with, so a phase flip
+ * can be told apart from "nothing moved". Same idea as updateGasDisplay()'s
+ * s_blinkPhase. */
+static bool  s_warnBlink = false;
 
 static void drawValue(int16_t x, int16_t y, uint8_t size, uint16_t color,
                       uint16_t clearW, char* last, const char* s) {
@@ -1183,17 +1187,41 @@ static void updateDisplay() {
     snprintf(buf, sizeof buf, "%s", mode);
     drawValue(108, 184, 2, GC9A01A_GREEN, 100, s_lastMode, buf);
 
+    /* A blink phase is a TIME-VARYING input and cannot ride the text
+     * change-gate: gate on `strcmp(s_lastWarn, warn)` alone and setTextColor()
+     * runs exactly once for the whole lifetime of a warning, because the mask
+     * changes only when the text does. The word was drawn in whichever colour
+     * the phase happened to be at and then froze — the 1 Hz attention blink
+     * below never actually happened on the panel. (updateOutputs() computes the
+     * same expression ungated, which is why the relay blinked but the text
+     * did not.) */
     const char* warn = s_warnLatched ? topWarnName(s_warnLatched) : "";
-    if (strcmp(s_lastWarn, warn)) {
-        strcpy(s_lastWarn, warn);
-        s_tft->fillRect(60, 202, 120, 10, GC9A01A_BLACK);
+    bool phase = ((millis() / 500) & 1) == 0;
+    bool textChanged = strcmp(s_lastWarn, warn) != 0;
+    bool blinkChanged = s_warnLatched && (phase != s_warnBlink);
+    if (textChanged || blinkChanged) {
+        if (textChanged) {
+            strcpy(s_lastWarn, warn);
+            s_tft->fillRect(60, 202, 120, 10, GC9A01A_BLACK);
+        }
         if (s_warnLatched) {
-            bool blink = ((millis() / 500) & 1) == 0;
+            /* Re-colouring deliberately skips the fillRect. The string, the
+             * cursor and the text size are all identical to the previous draw,
+             * so the glyph covers the same pixels — and Adafruit_GFX::drawChar
+             * writes ONLY the glyph's set pixels here, because the one-arg
+             * setTextColor() above sets textbgcolor = textcolor, which makes
+             * drawChar's `else if (bg != color)` false. Every pixel the last
+             * pass touched is therefore overwritten by this one, and skipping
+             * the rectangle keeps a blink flip to a few dozen setPixel calls
+             * instead of a 120x10 fill. The fillRect is required on the
+             * textChanged path only, where a shorter or differently shaped
+             * string would otherwise leave the old glyph's pixels behind. */
             s_tft->setCursor((240 - (int)strlen(warn) * 6) / 2, 202);
             s_tft->setTextSize(1);
-            s_tft->setTextColor(blink ? GC9A01A_RED : GC9A01A_DARKGREY);
+            s_tft->setTextColor(phase ? GC9A01A_RED : GC9A01A_DARKGREY);
             s_tft->print(warn);
         }
+        s_warnBlink = phase;
     }
 
     uint16_t sc;
