@@ -376,6 +376,26 @@ static bool argIsInt(const String& s) {
     return true;
 }
 
+/* Float sibling of argIsInt(), for the arguments that are genuinely fractional
+ * (coolant setpoints, tank capacity). Same reason: String::toFloat() stops at the
+ * first bad character, so "212abc" parses as 212.0, and atof() additionally
+ * accepts "nan" and "inf", so `(int)toFloat()` is undefined behaviour on those.
+ * Both facts have caused real defects here. Hoisted to file scope so `Q T` and
+ * `O<n>T` share one definition rather than each arm growing its own lambda -
+ * two copies of a validator is two copies to forget to update. */
+static bool argIsFloat(const String& s) {
+    if (s.length() == 0) return false;
+    bool seenDigit = false, seenDot = false;
+    for (unsigned i = 0; i < s.length(); i++) {
+        char ch = s[i];
+        if ((ch == '-' || ch == '+') && i == 0) continue;
+        if (ch == '.' && !seenDot) { seenDot = true; continue; }
+        if (ch < '0' || ch > '9') return false;
+        seenDigit = true;
+    }
+    return seenDigit;
+}
+
 static void handleCommand(const String& line);
 static bool pinOk(uint8_t p);
 static bool pinAliasFree(uint8_t p, int skip_idx, uint8_t assigning);
@@ -2293,22 +2313,9 @@ static void handleCommand(const String& line) {
             if (n > 6) { Serial.println("O<n> <mode>, n=1..7"); break; }
             String mode = val.substring(1);
             mode.trim();
-            /* argIsInt() at the top of this file already exists because
-             * String::toInt() returns 0 for anything it cannot parse, and 0
-             * cannot be told apart from a real 0 by testing the result. Both
-             * numeric modes below need the same test on a float argument. */
-            auto argIsFloat = [](const String& s) {
-                if (s.length() == 0) return false;
-                bool seenDigit = false, seenDot = false;
-                for (unsigned i = 0; i < s.length(); i++) {
-                    char ch = s[i];
-                    if ((ch == '-' || ch == '+') && i == 0) continue;
-                    if (ch == '.' && !seenDot) { seenDot = true; continue; }
-                    if (ch < '0' || ch > '9') return false;
-                    seenDigit = true;
-                }
-                return seenDigit;
-            };
+            /* argIsInt()/argIsFloat() at the top of this file already exist
+             * because String::toInt() returns 0 for anything it cannot parse,
+             * and 0 cannot be told apart from a real 0 by testing the result. */
             /* A rejected mode must not reach saveCfg() - the reject path used
              * to write NVS too, so a typo was persisted as well as applied. */
             bool accept = true;
@@ -2537,41 +2544,86 @@ static void handleCommand(const String& line) {
                 Serial.printf("gas point %u = %u mv\n", slot, g_cfg.gasCalMv[slot]);
                 break;
             }
+            /* All four of these are on the ESP-NOW allow-list
+             * (cmdAllowedFromLink permits Q with a "D "/"W "/"M "/"T " prefix),
+             * so they are AIR-reachable, and every one of them had the same two
+             * defects that 8b0bfbd fixed for F/I/T and 8b93a28 fixed for W:
+             *
+             *  1. `toInt()` on an unvalidated string. `Q D nan` -> atoi("nan")
+             *     is 0 -> 0 is in [0,15] -> gasDamp = 0, and gasSampleMv() does
+             *        if (g_cfg.gasDamp == 0 || s_gasFilt < 0) f = raw;
+             *     which bypasses the EMA entirely and drives the needle off
+             *     unfiltered 8-sample ADC. Same for `Q D abc`. Not a cosmetic
+             *     setting: it is the input filter for the fuel gauge.
+             *  2. saveCfg() unconditional, so a repeat of the CURRENT value
+             *     still commits a full ~180-byte NVS blob. Flooding `Q W 20`
+             *     (lowFuelPct defaults to 20) therefore drives one flash erase
+             *     per drained queue slot for as long as the flood lasts, on a
+             *     link that is not authenticated. That is the same amplification
+             *     8b0bfbd's own comment names as "the real cost, not the bytes" -
+             *     the rule was just never generalised to the Q family.
+             *
+             * So: validate the string, and only write NVS when the value moved.
+             */
             if (val.startsWith("D ")) {
-                int d = val.substring(2).toInt();
-                if (d >= 0 && d <= 15) {
+                String a = val.substring(2); a.trim();
+                if (!argIsInt(a)) { Serial.println("damp 0-15"); break; }
+                int d = a.toInt();
+                if (d < 0 || d > 15) { Serial.println("damp 0-15"); break; }
+                if ((uint8_t)d != g_cfg.gasDamp) {
                     g_cfg.gasDamp = (uint8_t)d;
-                    s_gasFilt = -1;
+                    s_gasFilt = -1;          // reseed the filter on any change
                     saveCfg();
-                    Serial.printf("gas damp=%u\n", d);
-                } else Serial.println("damp 0-15");
+                }
+                Serial.printf("gas damp=%u\n", d);
                 break;
             }
             if (val.startsWith("W ")) {
-                int w = val.substring(2).toInt();
-                if (w >= 5 && w <= 90) {
+                String a = val.substring(2); a.trim();
+                if (!argIsInt(a)) { Serial.println("warn 5-90%"); break; }
+                int w = a.toInt();
+                if (w < 5 || w > 90) { Serial.println("warn 5-90%"); break; }
+                if ((uint8_t)w != g_cfg.lowFuelPct) {
                     g_cfg.lowFuelPct = (uint8_t)w;
                     saveCfg();
-                    Serial.printf("low-fuel warn=%u%%\n", w);
-                } else Serial.println("warn 5-90%");
+                }
+                Serial.printf("low-fuel warn=%u%%\n", w);
                 break;
             }
             if (val.startsWith("M ")) {
-                int m = val.substring(2).toInt();
-                if (m >= 5 && m <= 99) {
+                String a = val.substring(2); a.trim();
+                if (!argIsInt(a)) { Serial.println("mpg range 5-99"); break; }
+                int m = a.toInt();
+                if (m < 5 || m > 99) { Serial.println("mpg range 5-99"); break; }
+                if ((uint8_t)m != g_cfg.gasMpg) {
                     g_cfg.gasMpg = (uint8_t)m;
                     saveCfg();
-                    Serial.printf("est-mpg=%u\n", g_cfg.gasMpg);
-                } else Serial.println("mpg range 5-99");
+                }
+                Serial.printf("est-mpg=%u\n", g_cfg.gasMpg);
                 break;
             }
             if (val.startsWith("T ")) {
-                int t = (int)(val.substring(2).toFloat() * 10.0f + 0.5f);
-                if (t >= 10 && t <= 500) {
+                /* Range-check the FLOAT before the cast, not the cast result.
+                 * `(int)(toFloat() * 10.0f + 0.5f)` is undefined behaviour for
+                 * nan/inf - atof accepts both - and the result is
+                 * toolchain-dependent (x86-64 cvttss2si gives INT_MIN, Xtensa
+                 * trunc.s something else). It happened to land outside [10,500]
+                 * and be rejected, so there was no live wrong value, but "it
+                 * works by luck on both ISAs" is not a check. Validating first
+                 * makes the cast defined by construction. */
+                String a = val.substring(2); a.trim();
+                if (!argIsFloat(a)) { Serial.println("tank 1.0-50.0 gal"); break; }
+                float gal = a.toFloat();
+                if (!isfinite(gal) || gal < 1.0f || gal > 50.0f) {
+                    Serial.println("tank 1.0-50.0 gal");
+                    break;
+                }
+                int t = (int)(gal * 10.0f + 0.5f);   // now in [10,500]: defined
+                if ((uint16_t)t != g_cfg.tankGalX10) {
                     g_cfg.tankGalX10 = (uint16_t)t;
                     saveCfg();
-                    Serial.printf("tank=%.1f gal\n", g_cfg.tankGalX10 / 10.0f);
-                } else Serial.println("tank 1.0-50.0 gal");
+                }
+                Serial.printf("tank=%.1f gal\n", g_cfg.tankGalX10 / 10.0f);
                 break;
             }
             Serial.printf("gas=%d%% mv=%d est=%dmi damp=%u warn<=%u%% mpg=%u tank=%.1fgal pts[F,3/4,1/2,1/4,E]=%u,%u,%u,%u,%u\n",
