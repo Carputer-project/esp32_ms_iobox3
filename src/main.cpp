@@ -918,20 +918,21 @@ static void updateOutputs() {
      */
     bool linkFresh = s_canFresh;
     bool engineRunning = groupSeen(0) && g_rpm > 300;
-    bool cltReadable  = groupSeen(2) && g_clt > 100 && g_clt < 3500;
-    bool cltHot       = cltReadable && g_clt >= g_cfg.fanOnTemp;
     bool fanHoldOn    = false;   /* minimum-on hold while the link is down */
 
     if (!linkFresh) {
         if (!s_fanHeldAfterLinkLoss) { s_fanHeldAfterLinkLoss = true; s_fanOffAtMs = millis(); }
         bool withinRunOn = (millis() - s_fanOffAtMs) < FAN_RUNON_MS;
 
-        /* Note on cltReadable: it requires groupSeen(2), so a frame that
-         * omitted group 2 makes cltHot false. That is correct for the warning
-         * path (do not act on absent data) but must NOT disable cooling: if the
-         * last known coolant was hot, keep cooling until we can prove it is not.
-         * So cltHot for the FAILSAFE uses the raw g_clt regardless of the
-         * group-seen flag, guarded only by a sane range. */
+        /* Cooling on link loss must not depend on the group-seen flag: a frame
+         * that omitted group 2 must not be able to switch the fan off when the
+         * last known coolant was hot. So this uses raw g_clt, guarded only by a
+         * sane range, and NOT the cltReadable gate above - that is correct for
+         * the warning path (do not act on absent data) and wrong here.
+         *
+         * (An earlier `cltHot = cltReadable && ...` local sat alongside this and
+         * was dead: the fail path used cltHotForFail, and cltReadable survived
+         * only to feed it. GCC -Wall confirms it was never read. Removed.) */
         bool cltHotForFail = (g_clt > 100 && g_clt < 3500 && g_clt >= g_cfg.fanOnTemp);
 
         fanHoldOn = cltHotForFail || withinRunOn;
@@ -1499,13 +1500,12 @@ static void gasAutoCal() {
     int32_t fOld = g_cfg.gasCalMv[0];
     if (fMv > GAS_CAL_VALID_LO && fMv < GAS_CAL_VALID_HI && fMv != fOld) {
         int32_t band  = inverted ? fOld + GAS_CAL_BAND_MV : fOld - GAS_CAL_BAND_MV;
-        bool bandFits = inverted ? (band < GAS_CAL_VALID_HI) : (band > GAS_CAL_VALID_LO);
         bool better   = inverted ? (fMv > fOld) : (fMv < fOld);
         bool clears   = inverted ? (fMv >= band) : (fMv <= band);
-        /* bandFits is asserted, not tested. If the floor is ever raised past
-         * stockFull-50 the FULL anchor silently becomes un-committable again -
-         * which is the original bug - so make it a build-time failure rather
-         * than a field report. kGasStockMv[0] is 1009. */
+        /* The band must fit inside the valid range, or the FULL anchor silently
+         * becomes un-committable again - which is the original bug. Asserted at
+         * build time rather than tested at runtime, so raising the floor is a
+         * compile failure and not a field report. kGasStockMv[0] is 1009. */
         static_assert(GAS_CAL_VALID_LO < (int32_t)kGasStockMv[0] - GAS_CAL_BAND_MV,
                       "GAS_CAL_VALID_LO leaves no room for the FULL anchor's band; "
                       "the anchor would become un-committable (the 2f086c1 bug)");
@@ -3365,12 +3365,29 @@ void setup() {
      * applyPinConfig() (or a panic handler), both outside setup()/loop(), so
      * it is reported rather than faked.
      *
-     * SIDE EFFECT: initialising the TWDT also subscribes the CPU0 idle task
-     * (CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU0=y). It is fed from the idle
-     * hook and loopTask blocks in delay(2) at ~500 Hz, so it is fed far inside
-     * 15 s. Usefully, it also means a pure busy-spin in loop() - which never
-     * blocks, so never feeds either watchdog - is still caught, by the idle
-     * task.
+     * SIDE EFFECT: none on this IDF, contrary to what this comment used to
+     * claim. It previously said that initialising the TWDT also subscribes the
+     * CPU0 idle task via CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU0=y, and that a
+     * busy-spin in loop() would therefore still be caught by the idle task.
+     * That is IDF 5.x behaviour. On IDF 4.4 (what arduino-esp32 2.0.17 ships)
+     * esp_task_wdt_init() does NOT subscribe the idle task. Verified against
+     * the prebuilt object this firmware links, not from the header:
+     *
+     *   $ xtensa-esp32-elf-objdump -dr task_wdt.c.obj \
+     *       | awk '/^[0-9a-f]+ <.*>:/ {fn=$2} /IdleTaskHandle/ {print fn}' | sort -u
+     *     <esp_task_wdt_add>:
+     *     <esp_task_wdt_delete>:
+     *
+     * Only esp_task_wdt_add and esp_task_wdt_delete touch the idle task handle;
+     * esp_task_wdt_init has zero references to it. (Arduino's own
+     * enableIdleWDT(), which this firmware does not call, is what would
+     * subscribe it.)
+     *
+     * The SAFETY property the old comment claimed is still true, by a different
+     * mechanism: a busy-spin in loop() never returns to the top of loopTask(),
+     * so it never reaches esp_task_wdt_reset() - and loopTask is itself
+     * subscribed to the TWDT by enableLoopWDT() below. Its own 15 s timer is
+     * what fires. There is one watchdog on loopTask, not two nets.
      */
     const esp_err_t wdtInit = esp_task_wdt_init(15, /*panic=*/true);
     enableLoopWDT();
