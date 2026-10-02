@@ -2127,13 +2127,44 @@ static void handleCommand(const String& line) {
             break;
         }
         case 'S': {
+            /* Validate the STRING, not the parsed result. String::toInt()
+             * returns 0 for anything unparseable, so `S abc` and a bare `S`
+             * both arrived as 0 and a `rpm > 0` test cannot tell a typo from
+             * an intended 0. Rejected input now has no effect at all: no state
+             * change and no saveCfg(), which used to run on the reject path too.
+             *
+             * The missing upper bound is the real defect. `S 40000` narrows
+             * 40000 into two int16_t fields, and narrowing an out-of-range int
+             * is implementation-defined; on this Xtensa build it is a
+             * truncating copy of the low 16 bits, so both shiftRpm and
+             * outRpm[0] became -25536. outRpm[0] is the field that actually
+             * drives output 1, and the consumer is
+             *   case OM_RPM: on = groupSeen(0) && g_rpm >= g_cfg.outRpm[i];
+             * against a uint32_t g_rpm, so -25536 promotes to 4294941760 and
+             * the comparison is never true - output 1 dead, silently, for as
+             * long as the value stays in NVS.
+             *
+             * Range matches the existing `W maxrpm` clamp,
+             * constrain(p1.toInt(), 1000, 20000), and the O<n>R check, so all
+             * three commands agree on what counts as a plausible rpm. */
+            if (!argIsInt(val)) { Serial.println("S <rpm> (e.g. S 7000)"); break; }
             int rpm = val.toInt();
-            if (rpm > 0) {
-                g_cfg.shiftRpm = rpm;
-                g_cfg.outMode[0] = OM_RPM;
-                g_cfg.outRpm[0] = rpm;
+            if (rpm < 1000 || rpm > 20000) { Serial.println("S 1000-20000 rpm"); break; }
+            /* outMode[0] is assigned below, so say what output 1 is being taken
+             * out of: this command has always reassigned that mode as a side
+             * effect and reported nothing. */
+            const char* was = "?";
+            switch (g_cfg.outMode[0]) {
+                case OM_OFF:  was = "off";  break;
+                case OM_MAN:  was = "man";  break;
+                case OM_TEMP: was = "temp"; break;
+                case OM_RPM:  was = "rpm";  break;
             }
+            g_cfg.shiftRpm = (int16_t)rpm;
+            g_cfg.outMode[0] = OM_RPM;
+            g_cfg.outRpm[0] = (int16_t)rpm;
             saveCfg();
+            Serial.printf("o1 R=%d rpm (was %s)\n", rpm, was);
             break;
         }
         case 'O': {
