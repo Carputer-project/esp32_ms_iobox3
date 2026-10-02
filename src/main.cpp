@@ -2634,10 +2634,43 @@ static void handleCommand(const String& line) {
             break;
         case 'X':
             // buzzer pin manual test: X0=pullup-hiz X1=float X2=drive3v3 X3=gnd(beep) X9=auto
-            if (val == "0")      { s_buzzManual = true; pinMode(g_cfg.pin.buzz, INPUT_PULLUP); Serial.println("buzzpin=input_pullup"); }
-            else if (val == "1") { s_buzzManual = true; pinMode(g_cfg.pin.buzz, INPUT);         Serial.println("buzzpin=float"); }
-            else if (val == "2") { s_buzzManual = true; pinMode(g_cfg.pin.buzz, OUTPUT); digitalWrite(g_cfg.pin.buzz, HIGH); Serial.println("buzzpin=high_3v3"); }
-            else if (val == "3") { s_buzzManual = true; pinMode(g_cfg.pin.buzz, OUTPUT); digitalWrite(g_cfg.pin.buzz, LOW);  Serial.println("buzzpin=gnd_beep (X 9 to exit)"); }
+            if (val == "0" || val == "1" || val == "2" || val == "3") {
+                /* ONE guard for every sub-command that takes the pin, not one per
+                 * line. X 0..3 all set s_buzzManual and then reconfigure the pad,
+                 * and on pin.buzz == pin.iac that pad is the IAC MOSFET gate: it is
+                 * driven by LEDC at 250Hz, and setIac()'s 0% is the CLOSED stop.
+                 *
+                 *   X 3 -> pinMode(19,OUTPUT); digitalWrite(19,LOW)   gate railed
+                 *          low, valve shut, engine running
+                 *   X 2 -> pinMode(19,OUTPUT); digitalWrite(19,HIGH)  gate commanded
+                 *          100% continuously against the PWM, valve slammed to the
+                 *          full-open stop and the solenoid DC-driven
+                 *   X 0/1 -> pinMode(19,INPUT)                       gate driver off
+                 *
+                 * and in all four cases s_buzzManual suppresses updateBuzzer()
+                 * while the restore path in `X 9` is gated OFF by its own
+                 * `pin.buzz != pin.iac` guard — so the documented way out could
+                 * never undo any of it. Only a power cycle cleared it.
+                 *
+                 * The check is `==` and sits ABOVE the first mutation, so a refusal
+                 * is a true no-op: s_buzzManual is not set and the pad is not
+                 * touched, leaving `X 9` still able to clear a manual test set
+                 * before this guard existed. A sub-command added below must be
+                 * written inside this branch to inherit the guard — it cannot be
+                 * added past it. */
+                if (g_cfg.pin.buzz == g_cfg.pin.iac) {
+                    Serial.printf("X %s REFUSED: buzzer pin GPIO%u is the IAC pin. A manual "
+                                  "test would take the idle-air valve off its 250Hz PWM. "
+                                  "Give the buzzer its own pin first: P BZ <pin>\n",
+                                  val.c_str(), g_cfg.pin.iac);
+                    break;
+                }
+                s_buzzManual = true;                 // pause auto drive; X 9 gives it back
+                if      (val == "0") { pinMode(g_cfg.pin.buzz, INPUT_PULLUP); Serial.println("buzzpin=input_pullup"); }
+                else if (val == "1") { pinMode(g_cfg.pin.buzz, INPUT);         Serial.println("buzzpin=float"); }
+                else if (val == "2") { pinMode(g_cfg.pin.buzz, OUTPUT); digitalWrite(g_cfg.pin.buzz, HIGH); Serial.println("buzzpin=high_3v3"); }
+                else                 { pinMode(g_cfg.pin.buzz, OUTPUT); digitalWrite(g_cfg.pin.buzz, LOW);  Serial.println("buzzpin=gnd_beep (X 9 to exit)"); }
+            }
             else if (val == "9") {
                 s_buzzManual = false;
                 // X 9 used to clear the manual flag only. After `X 0` or `X 1` the
@@ -2650,8 +2683,18 @@ static void handleCommand(const String& line) {
                     pinMode(g_cfg.pin.buzz, OUTPUT);
                     gpio_pullup_en((gpio_num_t)g_cfg.pin.buzz);
                     digitalWrite(g_cfg.pin.buzz, HIGH);   // inverted: HIGH = silent
+                    Serial.println("buzzpin=auto (output restored)");
+                } else {
+                    /* This used to print "output restored" unconditionally, on
+                     * the one configuration where this guard had just refused
+                     * to restore anything. `P BZ` cannot create the collision any
+                     * more (pinAliasFree rejects it) but a config saved before
+                     * that guard existed still loads with pin.buzz == pin.iac, and
+                     * on it the message contradicted the code. Report what the
+                     * guard actually did instead of claiming a restore. */
+                    Serial.printf("buzzpin=auto, but GPIO%u is the IAC pin — not touched, "
+                                  "it is on 250Hz PWM\n", g_cfg.pin.iac);
                 }
-                Serial.println("buzzpin=auto (output restored)");
             }
             else Serial.println("X0=pullup-hiz X1=float X2=3v3 X3=gnd(beep) X9=auto");
             break;
