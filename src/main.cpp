@@ -2142,20 +2142,95 @@ static void handleCommand(const String& line) {
             if (n > 6) return;
             String mode = val.substring(1);
             mode.trim();
+            /* argIsInt() at the top of this file already exists because
+             * String::toInt() returns 0 for anything it cannot parse, and 0
+             * cannot be told apart from a real 0 by testing the result. Both
+             * numeric modes below need the same test on a float argument. */
+            auto argIsFloat = [](const String& s) {
+                if (s.length() == 0) return false;
+                bool seenDigit = false, seenDot = false;
+                for (unsigned i = 0; i < s.length(); i++) {
+                    char ch = s[i];
+                    if ((ch == '-' || ch == '+') && i == 0) continue;
+                    if (ch == '.' && !seenDot) { seenDot = true; continue; }
+                    if (ch < '0' || ch > '9') return false;
+                    seenDigit = true;
+                }
+                return seenDigit;
+            };
+            /* A rejected mode must not reach saveCfg() - the reject path used
+             * to write NVS too, so a typo was persisted as well as applied. */
+            bool accept = true;
             if (mode == "0") { g_cfg.outMode[n] = OM_OFF; }
             else if (mode == "1") { g_cfg.outMode[n] = OM_MAN; g_cfg.outManual[n] = true; }
             else if (mode == "A") { g_cfg.outMode[n] = OM_OFF; }
             else if (mode.startsWith("T")) {
-                g_cfg.outMode[n] = OM_TEMP;
-                g_cfg.outTemp[n] = (int16_t)(mode.substring(1).toFloat() * 10.0f);
+                /* Check the STRING, then range-check the float, then cast.
+                 * `O6T` with no number is a case of "cannot parse", so toFloat()
+                 * hands back 0.0f, 0 * 10 = 0, and the consumer is
+                 *   case OM_TEMP: on = cltOk && clt >= g_cfg.outTemp[i];
+                 * with cltOk = groupSeen(2) && clt > 100 && clt < 3500. 0 is
+                 * satisfied by every valid reading, so one missing argument
+                 * latches the relay ON - and CFG_MAGIC is unchanged, so
+                 * saveCfg() made it survive every reboot.
+                 *
+                 * The upper bound is not cosmetic. 4000.0f * 10.0f = 40000 does
+                 * not fit int16_t and the (int16_t) cast of an out-of-range
+                 * float is undefined in C++, so `O6T 4000` stored whatever the
+                 * toolchain produced and `clt >= that` decides the relay. On
+                 * this Xtensa build that is trunc.s then sext from bit 15, i.e.
+                 * -25536, so it latched ON for the same reason 0 did - but the
+                 * result is compiler-dependent (x86-64 saturates to 32767 and
+                 * would instead kill the output), which is the whole argument
+                 * for refusing the value before it is cast rather than
+                 * inspecting what the cast produced.
+                 *
+                 * Range 20.0-250.0 degF. Floor excludes 0 and negatives, which
+                 * are exactly the values a missing argument and a negative
+                 * wrap produce. Ceiling is 250.0 degF = 2500 as stored: above
+                 * any coolant this engine reaches even under boost, and an
+                 * order of magnitude below the int16_t limit, so the wrap is
+                 * unreachable rather than merely unlikely. */
+                String tArg = mode.substring(1);
+                tArg.trim();
+                float tF = argIsFloat(tArg) ? tArg.toFloat() : -1.0f;
+                if (tF >= 20.0f && tF <= 250.0f) {
+                    g_cfg.outMode[n] = OM_TEMP;
+                    g_cfg.outTemp[n] = (int16_t)(tF * 10.0f);
+                    Serial.printf("o%u T=%.1f degF\n", n + 1, tF);
+                } else {
+                    accept = false;
+                    Serial.printf("O%u T 20.0-250.0 degF (e.g. O%u T 180)\n", n + 1, n + 1);
+                }
             } else if (mode.startsWith("R")) {
-                g_cfg.outMode[n] = OM_RPM;
-                g_cfg.outRpm[n] = (int16_t)mode.substring(1).toInt();
+                /* Same two doors, opposite directions, so one shared check
+                 * would be wrong. outRpm[] is int16_t compared against a
+                 * uint32_t g_rpm, so the stored value is promoted to unsigned:
+                 *   O6R      -> toInt() = 0 -> `g_rpm >= 0` is true for any
+                 *                value including a stopped engine -> latched ON.
+                 *   O1R 40000 -> 40000 truncates to -25536 -> promotes to
+                 *                4294941760 -> `g_rpm >=` is never true -> the
+                 *                output is dead, with no message anywhere.
+                 * Range 1000-20000 rpm: 1000 excludes 0 and negatives, and both
+                 * ends match the existing `W maxrpm` clamp
+                 * (constrain(p1.toInt(), 1000, 20000)) so the two commands
+                 * cannot disagree about what counts as a plausible rpm. */
+                String rArg = mode.substring(1);
+                rArg.trim();
+                int rK = argIsInt(rArg) ? rArg.toInt() : 0;
+                if (rK >= 1000 && rK <= 20000) {
+                    g_cfg.outMode[n] = OM_RPM;
+                    g_cfg.outRpm[n] = (int16_t)rK;
+                    Serial.printf("o%u R=%d rpm\n", n + 1, rK);
+                } else {
+                    accept = false;
+                    Serial.printf("O%u R 1000-20000 rpm (e.g. O%u R 7000)\n", n + 1, n + 1);
+                }
             } else {
                 g_cfg.outMode[n] = OM_MAN;
                 g_cfg.outManual[n] = (mode.toInt() != 0);
             }
-            saveCfg();
+            if (accept) saveCfg();
             break;
         }
         case 'L': {
