@@ -2467,8 +2467,21 @@ static void handleCommand(const String& line) {
              * a mapping that was never actually configured. */
             bool accept = true;
             if (m == "0") {
+                /* Disable has to drop the MAPPING too, not just the enable flag.
+                 * The O and F arms are the only writers of anOut[] anywhere in
+                 * the firmware, and neither the H/L arm nor the plain form ever
+                 * sets it. So `A1O7 5` + `A1 0` + `A1H 2` left anEnable true,
+                 * anOut still 7 and s_anLatch free to drive the fan - and the
+                 * `a1 thr=2.0V HIGH(12V)` confirmation the re-enable prints says
+                 * nothing about the mapping, so the retained output was
+                 * completely silent. The mapping is copied out of tgtName()'s
+                 * static buffer before it is cleared so the line can name it. */
+                char had[8];
+                snprintf(had, sizeof had, "%s", tgtName(g_cfg.anOut[n]));
                 g_cfg.anEnable[n] = false;
+                g_cfg.anOut[n] = 0;
                 s_anForce[n] = -1;      // disabling clears any bench force too
+                Serial.printf("a%u disabled, mapping to %s cleared\n", n + 1, had);
             } else if (m == "D1" || m == "D0" || m == "DA") {
                 // bench force: D1 latch on, D0 latch off, DA back to auto
                 s_anForce[n] = m == "D1" ? 1 : (m == "D0" ? 0 : -1);
