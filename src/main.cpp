@@ -2461,6 +2461,11 @@ static void handleCommand(const String& line) {
             if (n > 3) return;
             String m = val.substring(1);
             m.trim();
+            /* A rejected sub-form must not reach saveCfg() at the foot of this
+             * arm. The O and F arms used to assign anOut[]/anEnable[] and THEN
+             * look at the threshold, with no else, so the save below persisted
+             * a mapping that was never actually configured. */
+            bool accept = true;
             if (m == "0") {
                 g_cfg.anEnable[n] = false;
                 s_anForce[n] = -1;      // disabling clears any bench force too
@@ -2470,18 +2475,46 @@ static void handleCommand(const String& line) {
                 Serial.printf("a%u force=%s\n", n + 1,
                               s_anForce[n] < 0 ? "auto" : (s_anForce[n] ? "ON" : "off"));
             } else if (m.startsWith("O")) {
-                uint8_t o = (uint8_t)(m[1] - '1');
-                if (o <= 6) {
+                /* O<k> <v> = map this input to output k (1..7), latch above v
+                 * volts. Both halves are required and both are checked BEFORE
+                 * anything is assigned: the mapping used to be written first and
+                 * the threshold second, so `A3O7` (no threshold at all - a short,
+                 * valid-looking command) enabled the channel and pointed it at
+                 * output 7 at whatever anThresh already held, the 2000mV default
+                 * from the Cfg struct, with no message on any path. inputForces(7)
+                 * then gated an output on that input, and saveCfg() persisted it.
+                 *
+                 * argIsFloat() first, because toFloat() stops at the first bad
+                 * character: "5abc" is 5.0, and an unparseable argument hands back
+                 * 0.0 which the range check then has to catch on its own. */
+                uint8_t o = (uint8_t)(m[1] - '1');      // m[1] == '\0' on a bare "O" -> out of range
+                String tArg = m.substring(2);
+                tArg.trim();
+                float v = argIsFloat(tArg) ? tArg.toFloat() : -1.0f;
+                if (o <= 6 && v >= 0.1f && v <= 15.0f) {
                     g_cfg.anOut[n] = o + 1;
                     g_cfg.anEnable[n] = true;
-                    float v = m.substring(2).toFloat();
-                    if (v >= 0.1f && v <= 15.0f) g_cfg.anThresh[n] = (uint16_t)(v * 1000.0f);
+                    g_cfg.anThresh[n] = (uint16_t)(v * 1000.0f);
+                    Serial.printf("a%u %s thr=%.1fV\n", n + 1, tgtName(o + 1), v);
+                } else {
+                    accept = false;
+                    Serial.printf("A%u O<k> <v>, k=1..7 v=0.1-15.0V (got \"%s\")\n", n + 1, m.c_str());
                 }
             } else if (m.startsWith("F")) {
-                g_cfg.anOut[n] = 7;
-                g_cfg.anEnable[n] = true;
-                float v = m.substring(1).toFloat();
-                if (v >= 0.1f && v <= 15.0f) g_cfg.anThresh[n] = (uint16_t)(v * 1000.0f);
+                /* Same two-part contract as the O arm, same order of checks. F is
+                 * just the fan output (7) spelled out. */
+                String tArg = m.substring(1);
+                tArg.trim();
+                float v = argIsFloat(tArg) ? tArg.toFloat() : -1.0f;
+                if (v >= 0.1f && v <= 15.0f) {
+                    g_cfg.anOut[n] = 7;
+                    g_cfg.anEnable[n] = true;
+                    g_cfg.anThresh[n] = (uint16_t)(v * 1000.0f);
+                    Serial.printf("a%u %s thr=%.1fV\n", n + 1, tgtName(7), v);
+                } else {
+                    accept = false;
+                    Serial.printf("A%u F <v>, v=0.1-15.0V (got \"%s\")\n", n + 1, m.c_str());
+                }
             } else if (m.length() >= 2 && (m[0] == 'H' || m[0] == 'L')) {
                 // H<v> = active-high threshold, L<v> = active-low (GND-switched).
                 // L-mode latches when the wire is PULLED TO GND — only for
@@ -2504,7 +2537,7 @@ static void handleCommand(const String& line) {
                     saveAnPol();
                 }
             }
-            saveCfg();
+            if (accept) saveCfg();
             break;
         }
         case 'M': {
